@@ -3,5 +3,6 @@
 
 pub mod config;
 pub mod pipeline;
+pub mod pose;
 pub mod tba;
 pub mod video;

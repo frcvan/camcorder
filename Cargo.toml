@@ -8,6 +8,8 @@ description = "Pull FRC match stats and match video from The Blue Alliance, then
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
+kornia-apriltag = "0.2.0"
+kornia-image = "0.2.0"
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
     "json",

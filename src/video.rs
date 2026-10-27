@@ -53,6 +53,11 @@ const BOTTOM_SEAM_RANGE: (f64, f64) = (0.42, 0.58);
 const OVERVIEW_ASPECT: (f64, f64) = (2.2, 3.1);
 /// Aspect ratio range of a lower sub-view.
 const SUBVIEW_ASPECT: (f64, f64) = (1.1, 3.0);
+/// How closely the two sub-view widths must match each other.
+const SUBVIEW_SYMMETRY: f64 = 0.96;
+/// Share of sampled frame pairs that must show movement for the segment to be
+/// live cameras rather than a drawn board.
+const MOVING_SHARE_FLOOR: f32 = 0.75;
 const MIN_FRAME_SIDE: u32 = 64;
 
 // ---------------------------------------------------------------------------
@@ -446,11 +451,14 @@ pub fn detect_layout(path: &Path, info: &VideoInfo, window: (f64, f64)) -> Resul
 
     // A results screen is drawn from the same panels as the broadcast — a wide
     // band on top, two columns below — but it is a still graphic, not cameras.
-    let motion = motion(&frames);
+    // A segment that *ends* on one (the celebration, then the board) has to be
+    // caught too, so what counts is how much of the segment is moving, not how
+    // much motion it averages.
+    let moving = moving_share(&frames);
     if std::env::var_os("CAMCORDER_DEBUG_LAYOUT").is_some() {
-        eprintln!("  [motion] {motion:.2}");
+        eprintln!("  [motion] {:.0}% of samples move", moving * 100.0);
     }
-    if motion < MOTION_FLOOR {
+    if moving < MOVING_SHARE_FLOOR {
         return Ok(Detected { samples, ..single });
     }
 
@@ -476,6 +484,11 @@ pub fn detect_layout(path: &Path, info: &VideoInfo, window: (f64, f64)) -> Resul
         || !plausible(side.start, bottom_height, SUBVIEW_ASPECT)
         || !plausible(info.width - side.end, bottom_height, SUBVIEW_ASPECT)
     {
+        return Ok(Detected { samples, ..single });
+    }
+    // The two sub-views are cut from the same frame with the same margin, so
+    // they come out the same width. A panel of a scoreboard splits lopsidedly.
+    if !matched_widths(side.start, info.width - side.end) {
         return Ok(Detected { samples, ..single });
     }
 
@@ -504,6 +517,17 @@ pub fn detect_layout(path: &Path, info: &VideoInfo, window: (f64, f64)) -> Resul
 fn plausible(width: u32, height: u32, range: (f64, f64)) -> bool {
     let aspect = width as f64 / height.max(1) as f64;
     aspect >= range.0 && aspect <= range.1
+}
+
+/// Are two sub-view widths close enough to be a pair of camera feeds?
+fn matched_widths(left: u32, right: u32) -> bool {
+    let (left, right) = (left as f64, right as f64);
+    let (narrow, wide) = if left < right {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    wide > 0.0 && narrow / wide >= SUBVIEW_SYMMETRY
 }
 
 /// A divider, as a half-open range of rows or columns, and how strongly it read.
@@ -681,6 +705,7 @@ impl Profile {
 }
 
 /// One frame, at full resolution, in planar YUV.
+#[derive(Clone)]
 struct YuvFrame {
     width: usize,
     height: usize,
@@ -754,33 +779,42 @@ impl Analysis {
     }
 }
 
-/// Mean absolute change between the sampled frames: live picture moves, a title
-/// card or a results screen does not.
-fn motion(frames: &[YuvFrame]) -> f32 {
-    let mut total = 0.0f64;
-    let mut counted = 0usize;
+/// Share of consecutive sample pairs in which the picture changes. Live footage
+/// moves all the way through a segment; a results screen is still for most of
+/// it, even when the segment opens on a replay.
+fn moving_share(frames: &[YuvFrame]) -> f32 {
+    let mut moving = 0usize;
+    let mut pairs = 0usize;
     for window in frames.windows(2) {
-        let (before, after) = (&window[0].y, &window[1].y);
-        if before.len() != after.len() || before.is_empty() {
-            continue;
-        }
-        // A sparse stride is enough: this asks whether anything moved at all.
-        let stride = (before.len() / 4096).max(1);
-        let mut sum = 0.0f64;
-        let mut count = 0usize;
-        for index in (0..before.len()).step_by(stride) {
-            sum += (before[index] as f32 - after[index] as f32).abs() as f64;
-            count += 1;
-        }
-        if count > 0 {
-            total += sum / count as f64;
-            counted += 1;
+        if let Some(change) = pair_change(&window[0], &window[1]) {
+            pairs += 1;
+            if change >= MOTION_FLOOR {
+                moving += 1;
+            }
         }
     }
-    if counted == 0 {
+    if pairs == 0 {
         return 0.0;
     }
-    (total / counted as f64) as f32
+    moving as f32 / pairs as f32
+}
+
+/// Mean absolute luma change between two frames, sampled sparsely.
+fn pair_change(before: &YuvFrame, after: &YuvFrame) -> Option<f32> {
+    if before.y.len() != after.y.len() || before.y.is_empty() {
+        return None;
+    }
+    let stride = (before.y.len() / 4096).max(1);
+    let mut total = 0.0f64;
+    let mut count = 0usize;
+    for index in (0..before.y.len()).step_by(stride) {
+        total += (before.y[index] as f32 - after.y[index] as f32).abs() as f64;
+        count += 1;
+    }
+    if count == 0 {
+        return None;
+    }
+    Some((total / count as f64) as f32)
 }
 
 fn row_profile(analysis: &Analysis) -> Profile {
@@ -1342,6 +1376,48 @@ some other ffmpeg chatter pts_time:99";
             *slot = 140.0;
         }
         assert!(find_divider(&profile_of(stepped), (0.0, 1.0), 400, |_| true).is_none());
+    }
+
+    fn grey_frame(width: usize, height: usize, level: u8) -> YuvFrame {
+        let chroma = (width / 2) * (height / 2);
+        YuvFrame {
+            width,
+            height,
+            chroma_width: width / 2,
+            y: vec![level; width * height],
+            u: vec![128; chroma],
+            v: vec![128; chroma],
+        }
+    }
+
+    #[test]
+    fn a_results_screen_does_not_count_as_live() {
+        // Four moving samples then four still ones: the celebration, then the board.
+        let mut frames = Vec::new();
+        for index in 0..9 {
+            let level = if index < 4 { (index * 40) as u8 } else { 200 };
+            frames.push(grey_frame(64, 64, level));
+        }
+        assert_eq!(moving_share(&frames), 0.5);
+
+        // A live segment moves every time.
+        let live: Vec<YuvFrame> = (0..9)
+            .map(|index| grey_frame(64, 64, (index * 20) as u8))
+            .collect();
+        assert_eq!(moving_share(&live), 1.0);
+
+        // A title card or a board held for the whole segment never moves.
+        let still = vec![grey_frame(64, 64, 90); 9];
+        assert_eq!(moving_share(&still), 0.0);
+    }
+
+    #[test]
+    fn sub_views_must_be_the_same_width() {
+        assert!(matched_widths(952, 954));
+        assert!(matched_widths(942, 944));
+        assert!(!matched_widths(906, 1006));
+        assert!(!matched_widths(932, 984));
+        assert!(!matched_widths(0, 0));
     }
 
     #[test]

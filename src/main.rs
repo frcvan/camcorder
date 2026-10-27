@@ -67,6 +67,29 @@ enum Command {
         #[arg(long, value_name = "DIR")]
         out: Option<PathBuf>,
     },
+    /// Estimate the camera's field-relative pose from the AprilTags in a video.
+    Pose {
+        /// Video file to measure.
+        video: PathBuf,
+        /// Bundled tag layout name, or a path to a WPILib field layout JSON.
+        #[arg(long, value_name = "NAME|FILE", default_value = "2025-reefscape-welded")]
+        tag_layout: String,
+        /// Horizontal field of view of the camera, in degrees.
+        #[arg(long, value_name = "DEG", default_value_t = 60.0)]
+        fov: f64,
+        /// Tag edge length, in metres.
+        #[arg(long, value_name = "M", default_value_t = camcorder::pose::FRC_TAG_SIZE_M)]
+        tag_size: f64,
+        /// How many frames to measure.
+        #[arg(long, value_name = "N", default_value_t = 10)]
+        samples: usize,
+        /// Only look at this part of the video, in seconds.
+        #[arg(long, value_name = "SEC", num_args = 2, value_names = ["START", "END"])]
+        window: Option<Vec<f64>>,
+        /// Where to write the JSON report (defaults to <output dir>/poses/<stem>.json).
+        #[arg(long, value_name = "FILE")]
+        json: Option<PathBuf>,
+    },
     /// Whole pipeline: stats, then video, then views. This is the default.
     Run,
 }
@@ -96,6 +119,21 @@ fn run() -> Result<()> {
     let paths = Paths::new(config.output.dir.clone());
 
     let command = cli.command.unwrap_or(Command::Run);
+    if let Command::Pose {
+        video,
+        tag_layout,
+        fov,
+        tag_size,
+        samples,
+        window,
+        json,
+    } = &command
+    {
+        let dest = json
+            .clone()
+            .unwrap_or_else(|| default_pose_file(&paths, video));
+        return measure_pose(video, tag_layout, *fov, *tag_size, *samples, window.clone(), &dest);
+    }
     if let Command::Views { video, out } = &command {
         let dest = out
             .clone()
@@ -222,6 +260,57 @@ fn split_one(config: &CamcorderConfig, input: &Path, dest: &Path, force: bool) -
     for path in &report.outputs {
         println!("{}", path.display());
     }
+    Ok(())
+}
+
+fn default_pose_file(paths: &Paths, video: &Path) -> PathBuf {
+    let stem = video
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("video");
+    paths.root.join("poses").join(format!("{stem}.json"))
+}
+
+fn measure_pose(
+    video: &Path,
+    tag_layout: &str,
+    fov: f64,
+    tag_size: f64,
+    samples: usize,
+    window: Option<Vec<f64>>,
+    dest: &Path,
+) -> Result<()> {
+    let options = camcorder::pose::PoseOptions {
+        tag_layout: tag_layout.to_string(),
+        horizontal_fov_deg: fov,
+        tag_size_m: tag_size,
+        samples,
+        window: window.map(|window| (window[0], window[1])),
+        ..camcorder::pose::PoseOptions::default()
+    };
+    let report = camcorder::pose::estimate(video, &options)?;
+    eprintln!(
+        "[pose] {} ({}x{} · {} tags seen · {} · fov {:.0}° · tag {:.1}cm)",
+        video.display(),
+        report.frame_width,
+        report.frame_height,
+        report.tags_seen.len(),
+        report.tag_layout,
+        report.horizontal_fov_deg,
+        report.tag_size_m * 100.0,
+    );
+    print!("{}", report.render_table());
+    if let Some(height) = report.median_height() {
+        eprintln!("[pose] median camera height {height:.2}m");
+    }
+    if let Some(best) = report.best() {
+        eprintln!(
+            "[pose] best frame {:.1}s · rms {:.1}px · at ({:.2}, {:.2}, {:.2})m",
+            best.time, best.rms_px, best.position[0], best.position[1], best.position[2]
+        );
+    }
+    report.write_json(dest)?;
+    eprintln!("  wrote {}", dest.display());
     Ok(())
 }
 

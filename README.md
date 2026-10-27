@@ -61,6 +61,7 @@ file are caught immediately.
 | `camcorder stats` | pull and print match stats, write the raw JSON |
 | `camcorder download` | download the match videos only |
 | `camcorder views <FILE> [--out DIR]` | split one video file you already have |
+| `camcorder pose <FILE> [--tag-layout …] [--fov …]` | camera pose from the AprilTags in a video |
 | `camcorder --help` | all flags (`--force`, `--verbose`, `--config`, …) |
 
 The stats table shows each match's alliance, result, score, opponent score and
@@ -134,6 +135,45 @@ other way:
 Pinned layouts crop at exact fractions of the frame (`width / cols`,
 `height / rows`), so they suit uniform grids. `views` prints the panes it used
 and where they came from, so a wrong split is visible at a glance.
+
+## Camera pose from AprilTags
+
+```sh
+camcorder pose match.mp4                        # 2025 field, 60° lens assumed
+camcorder pose match.mp4 --tag-layout 2026-rebuilt-welded --fov 45 2>/dev/null
+```
+
+Samples frames from the video, reads the 36h11 tags in each one, and solves
+where the camera must have been to see them that way: position in field
+coordinates, yaw, pitch and roll, plus the reprojection error that says how
+much to trust the number. The tabular result goes to stderr and a JSON report
+to `<output dir>/poses/<file>.json` (or `--json`).
+
+The tag maps are WPILib's own field layouts, copied verbatim into
+`assets/tags/` — `2025-reefscape-welded`, `2025-reefscape-andymark`,
+`2026-rebuilt-welded` and `2026-rebuilt-andymark` — or any layout file you
+trust via `--tag-layout path/to/layout.json`. `assets/tags/README.md` records
+where each came from and how to refresh them.
+
+Two things the estimate cannot work out by itself: the lens, and the field the
+video was shot on. `--fov` is the source camera's horizontal field of view
+(60° is a reasonable broadcast guess), and getting it wrong scales the
+distance — a pose can be self-consistent, with sub-pixel reprojection error,
+and still be 20% too far away. `--tag-size` is 6.5 in for FRC tags.
+
+One tag is enough for a pose but not enough to lean on: it fixes the direction
+the camera looks far better than how far away it is, so a single far tag and a
+wrong `--fov` can be metres out while reporting a sub-pixel fit. Frames with two
+or more tags that agree are the ones worth trusting, and the `tags` column says
+which is which. `CAMCORDER_DEBUG_POSE=1` prints every detection (id, where it
+was, how big, decoder margin) and the result for each frame, which is the quick
+way to see why a video produced nothing.
+
+This only works where the tags are big enough to read: a wide overview from the
+far side of the venue puts them at a dozen pixels and nothing will decode them,
+while a zoomed sub-view or a close-up camera usually will. It is a separate
+subsystem (`src/pose/`) and shares nothing with the splitter except the ffmpeg
+and ffprobe helpers.
 
 ## Notes
 
