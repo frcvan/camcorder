@@ -1,0 +1,39 @@
+# camcorder.toml — what to pull and how to split it.
+
+# FRC team number to pull match data for.
+team = 254
+
+# Season to pull matches from (all events that year).
+year = 2025
+
+# Optional: narrow the run to a single event key. Leave unset for the whole season.
+# event = "2025casj"
+
+[output]
+# Everything (match JSON, downloaded video, split views) lands under this directory.
+# Defaults to a temp directory ($TMPDIR/camcorder). Uncomment to keep the files.
+# dir = "/tmp/camcorder"
+
+[video]
+# How to turn one video into its individual views:
+#   "both"   (default) crop tiled views out of the frame, then cut each into scenes
+#   "tiled"  only crop tiled views (one output per view, whole video)
+#   "scenes" only split on scene changes (no cropping)
+mode = "both"
+
+# Camera layout inside the frame:
+#   "auto"    (default) the broadcast layout: one wide overview above two
+#             sub-views, detected per segment; anything else stays one view
+#   "1x1"     a single view (never crop)
+#   "1x2"     "2x1"  "2x2"  "3x1"  ... rows x cols, pinned exactly
+layout = "auto"
+
+# Scene-change sensitivity for ffmpeg's scene score (0.0-1.0). Lower = more cuts.
+scene_threshold = 0.4
+
+# Ignore cuts that would create a segment shorter than this many seconds.
+scene_min_len = 2.0
+
+# x264 quality/speed for the split outputs.
+crf = 18
+preset = "veryfast"
