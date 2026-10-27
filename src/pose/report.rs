@@ -84,6 +84,26 @@ impl FramePose {
         }
     }
 
+    /// Replace this row's pose with the one the fixed-camera fit gives it.
+    ///
+    /// A single tag is solved two equally well-fitting ways, so a per-frame
+    /// solve can land on the far side of the wall from the camera that filmed
+    /// it. Once the run knows where the camera stood, the row should say that,
+    /// and keep its own orientation — the camera panned and zoomed, it did not
+    /// move. `rms_px` is recomputed by the caller against the new pose.
+    pub(crate) fn adopt(&mut self, pose: &CameraPose) {
+        self.position = [pose.position.x, pose.position.y, pose.position.z];
+        self.rotation = [
+            pose.rotation.w,
+            pose.rotation.x,
+            pose.rotation.y,
+            pose.rotation.z,
+        ];
+        self.yaw_deg = pose.yaw_deg();
+        self.pitch_deg = pose.pitch_deg();
+        self.roll_deg = pose.roll_deg();
+    }
+
     /// The alliance the frame's colours show, as one word for the table.
     fn side_label(&self) -> &'static str {
         match self.side.as_ref().map(|side| side.alliance) {
@@ -117,6 +137,83 @@ pub struct StationReport {
     pub frames_rejected: usize,
 }
 
+/// A sampled orientation and focal length fitted at the shared camera position.
+#[derive(Debug, Clone, Serialize)]
+pub struct PtzFrameReport {
+    pub time: f64,
+    pub rotation: [f64; 4],
+    pub focal_px: f64,
+}
+
+/// A shared camera centre only reported when the observations constrain it.
+#[derive(Debug, Clone, Serialize)]
+pub struct PtzStationReport {
+    pub position: [f64; 3],
+    pub rms_px: f64,
+    /// Number of frames containing matched 3D field-model structure.
+    pub model_frames: usize,
+    /// Tag corner observations the fixation was based on.
+    pub corner_samples: usize,
+    /// Image-to-model line observations the fixation was based on.
+    pub line_samples: usize,
+    /// Largest displacement of the centre the footage could not rule out, metres.
+    /// Censored: `2.0` means "more than two metres, the probe's reach".
+    pub sigma_m: f64,
+    /// Frames whose own solve agreed with this centre, out of `frames.len()`:
+    /// the evidence the position rests on. A lone tag solves about as well from
+    /// the far side of the wall, so on a single-tag pane the frames split into
+    /// two basins and this counts only the one the answer came from.
+    pub frames_agreeing: usize,
+    /// Frames that had to be re-aimed at this centre, having been solved from
+    /// somewhere else by their own frame.
+    pub frames_stray: usize,
+    /// Frames the fitted camera does not explain even after re-aiming.
+    pub frames_unexplained: usize,
+    /// Whether the centre is too loosely determined to be read as a position.
+    pub ambiguous: bool,
+    pub frames: Vec<PtzFrameReport>,
+}
+
+impl PtzStationReport {
+    /// One line for the table: the centre, and how tightly it is held.
+    pub fn describe(&self) -> String {
+        let bound = if self.ambiguous {
+            format!(
+                "not pinned: a camera up to {:.1}m away explains these frames too",
+                self.sigma_m
+            )
+        } else {
+            format!("within {:.2}m of this", self.sigma_m)
+        };
+        let mut evidence = format!(
+            "{} corner(s) in {} frame(s), {} agreeing on this centre",
+            self.corner_samples,
+            self.frames.len(),
+            self.frames_agreeing
+        );
+        if self.frames_stray > 0 {
+            evidence.push_str(&format!(", {} re-aimed from elsewhere", self.frames_stray));
+        }
+        if self.frames_unexplained > 0 {
+            evidence.push_str(&format!(
+                ", {} not explained by it",
+                self.frames_unexplained
+            ));
+        }
+        let structure = match self.model_frames {
+            0 => "no model structure matched".to_string(),
+            frames => format!(
+                "{} model line match(es) in {frames} frame(s)",
+                self.line_samples
+            ),
+        };
+        format!(
+            "fixed position ({evidence}, {structure}, rms {:.1}px, {bound}): ({:.2}, {:.2}, {:.2})m",
+            self.rms_px, self.position[0], self.position[1], self.position[2]
+        )
+    }
+}
+
 /// Everything one run found.
 #[derive(Debug, Clone, Serialize)]
 pub struct PoseReport {
@@ -146,6 +243,8 @@ pub struct PoseReport {
     pub min_confidence: f64,
     /// The one pose that fits every frame of the station, when there was one.
     pub station: Option<StationReport>,
+    /// Fixed position with independent pan, tilt, roll and zoom when constrained.
+    pub ptz_station: Option<PtzStationReport>,
 }
 
 impl PoseReport {
@@ -227,6 +326,15 @@ impl PoseReport {
                 {
                     let _ = writeln!(out, "  {:5.1}s: {disagreement}", frame.time);
                 }
+            }
+        }
+        if let Some(ptz) = &self.ptz_station {
+            let _ = writeln!(out, "  {}", ptz.describe());
+            if ptz.ambiguous {
+                let _ = writeln!(
+                    out,
+                    "    the centre is the best fit, not a measurement: with this much footage a camera elsewhere fits nearly as well"
+                );
             }
         }
         if self.pane == Pane::Overview {

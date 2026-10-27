@@ -39,6 +39,8 @@ src/video.rs     ffmpeg: probe, scene cuts, divider detection, cropping
 src/pose/        camera pose from AprilTags — self-contained subsystem
   types.rs       Vec3/Mat3/Quat/Intrinsics/CameraPose, no dependencies
   layout.rs      WPILib field layouts and tag corners
+  model.rs       image-to-model observations from the field asset
+  model.rs       image-to-model line observations, from the field asset
   frames.rs      RGB frame sampling (owns all ffmpeg use) and luma from it
   enhance.rs     contrast stretch + unsharp, before the decoder sees a frame
   detect.rs      36h11 detection (the only file that knows kornia)
@@ -99,15 +101,58 @@ sweeping the focal from 400px to 1000px moves the camera 2–3 m with the
 reprojection flat at 0.25–0.35 px. Trust the direction and the side reading from
 that footage, not the metres.
 
-**The camera stood still, so fit one pose to it.** `station` fits a single pose to
-every frame's corners, dropping frames that disagree (a pan, or a bad solve). The
-per-frame poses stay in the report: a camera that really panned has to keep
-showing as having panned.
+**The camera stood still, so fit the camera, not each frame.** `station::fit`
+fits one *pose* to every frame's corners, dropping frames that disagree (a pan,
+or a bad solve). `station::fit_ptz` fits one shared *position* while letting each
+frame keep its own orientation and focal length, because a fixed camera on a
+broadcast stand pans and zooms without moving. The per-frame poses stay in the
+report: a camera that really panned has to keep showing as having panned.
 
 **Cameras in the stands are outside the field.** Positions like y = 12–14 m on
 an 8 m-wide field are correct broadcast camera positions, not bugs. Underground
 (z < 0) is the impossible one, and the gates reject it: a frame whose only solve
 is impossible is reported in `missed` with the reason rather than in `solved`.
+
+**One frame must not move the camera.** A lone tag solves two ways — the camera
+in front of it, and a camera on the far side of the wall — and which one a frame
+picks is noise. So the shared centre comes from *agreement*: the position with
+the most frames within a metre of it, which on Orlando was 11 of 13 frames in one
+pane and 15 of 19 in the other. Choosing by reprojection error instead is what
+put both cameras in the middle of the field: two frames that agreed with each
+other outvoted ten that agreed on the corner. A frame whose own solve landed
+elsewhere is then **re-aimed** at the shared centre and re-solved there, because
+its orientation was fitted from a position the camera was never at and from the
+real centre can point straight away from the tag — where the residual is a flat
+penalty with no slope to descend. Frames that still do not fit are counted in
+`frames_unexplained` rather than kept quietly. A field-model round has to obey
+the same rule: moving the centre metres for a hundredth of a pixel is not a
+refinement.
+
+**A low camera is not an impossible camera.** The Rerun script used to drop
+frames below 0.5m, on the theory that the mirror branch is underground. Orlando's
+panes stand at 0.28m and 0.43m, so that default discarded every frame that had
+solved correctly and kept only the ones that had not. Only a pose below the
+carpet is impossible; the viewer's floor now defaults to 0.
+
+**A weak fit is reported, not withheld.** `pose` always reports the shared
+position it fitted, together with `sigma_m`: the largest displacement of that
+position which still explains the frames once each frame is free to re-aim and
+re-zoom. When `sigma_m` reaches the probe's reach (2m), or the fit does not even
+reproject the frames within `--max-rms`, the report marks the position
+`ambiguous` and the table says it is a best estimate rather than a measurement.
+This exists because an Orlando pane holding one 16px tag fits its frames to a
+tenth of a pixel at more than one position: quoting either as *the* camera would
+be the mistake. Read the position, then read the flag.
+
+**The field model is evidence only where the picture agrees.** `model.rs`
+matches the AdvantageScope asset's long red/blue alliance tape (identified by
+colour) and the box outline of the structure each decoded tag is mounted on
+(identified by tag id, so it can never be the wrong structure) — the second is
+the only thing that breaks a lone tag's scale ambiguity, since the mount is not
+on the tag's plane. A match is only recorded where the picture actually has an
+edge, and matches are looked for afresh as the fit improves. On Orlando the
+structure contributed nothing: its matches were coincidental and the fit
+without them was kept, which the report shows as `model_frames: 0`.
 
 **The overview pane is named, not detected.** The splitter writes the top pane
 of every segment as `segNN_view1.mp4`, and `pose` takes that for the wide

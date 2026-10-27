@@ -33,6 +33,7 @@ pub mod detect;
 pub mod enhance;
 pub mod frames;
 pub mod layout;
+mod model;
 pub mod report;
 pub mod side;
 pub mod solve;
@@ -52,6 +53,10 @@ pub use types::{CameraPose, Intrinsics, Quat, TagObservation, Vec3};
 
 /// Tag edge length of the FRC field tags, in metres (6.5 inches).
 pub const FRC_TAG_SIZE_M: f64 = 0.1651;
+
+/// How far a field-model round may move the fitted camera before it counts as a
+/// different camera rather than a refinement of the same one.
+const MODEL_ROUND_MAX_MOVE_M: f64 = 1.0;
 
 /// A frame whose solve reprojects worse than this is not trusted.
 const DEFAULT_MAX_RMS_PX: f64 = 8.0;
@@ -261,6 +266,7 @@ impl Judge<'_> {
                 .collect(),
                 pose: solution.pose,
                 tags: solution.tags.clone(),
+                lines: Vec::new(),
             });
             evaluated.frames.push(FramePose::new(report::FrameOutcome {
                 time: frame.time,
@@ -410,7 +416,7 @@ pub fn estimate(video: &Path, options: &PoseOptions) -> Result<PoseReport> {
     let calibration = station::calibrate(&provisional.views, assumed);
 
     let calibrated;
-    let evaluated = if calibration.measured {
+    let mut evaluated = if calibration.measured {
         calibrated = Judge {
             layout: &layout,
             camera: &calibration.intrinsics,
@@ -447,6 +453,136 @@ pub fn estimate(video: &Path, options: &PoseOptions) -> Result<PoseReport> {
         frames_rejected: fitted.frames_rejected,
     });
 
+    // The shared centre is fitted from the tags first, then re-fitted with the
+    // field model: the first fit is what makes the model match meaningful, since
+    // the structure can only be looked for once there is a pose to project it
+    // from. Each later round starts from the pose the previous one fitted, so its
+    // search window can be tighter and a match cannot be to a nearby stranger.
+    let ptz_views = evaluated.views.clone();
+    let mut ptz_station = station::fit_ptz(
+        &ptz_views,
+        &calibration.intrinsics,
+        &layout,
+        options.max_rms_px,
+    );
+    if options.tag_layout == "2026-rebuilt-welded" {
+        let mut rematched = ptz_views.clone();
+        for (round, search_px) in [model::EDGE_SEARCH_WIDE_PX, model::EDGE_SEARCH_TIGHT_PX]
+            .into_iter()
+            .enumerate()
+        {
+            let Some(current) = ptz_station.as_ref() else {
+                break;
+            };
+            if current.views.len() != rematched.len() {
+                break;
+            }
+            for (index, (view, (pose, camera))) in
+                rematched.iter_mut().zip(&current.views).enumerate()
+            {
+                let Some(frame) = sampled
+                    .iter()
+                    .find(|frame| frame.time == evaluated.frames[index].time)
+                else {
+                    continue;
+                };
+                view.lines = model::observations(frame, pose, camera, &view.tags, search_px);
+            }
+            let Some(next) = station::fit_ptz(
+                &rematched,
+                &calibration.intrinsics,
+                &layout,
+                options.max_rms_px,
+            ) else {
+                break;
+            };
+            // Keep a round only if it explains the frames at least as well: a
+            // worse joint fit means the new matches pulled the camera away.
+            // A round has to earn its keep. Model matches move the centre a
+            // little as they pull it onto real edges; a round that moves it
+            // metres for a hundredth of a pixel has been captured by a handful
+            // of coincidental matches and is not a refinement of the same
+            // camera.
+            let moved = (next.position - current.position).norm();
+            let better = next.rms_px <= current.rms_px
+                && (moved <= MODEL_ROUND_MAX_MOVE_M || next.rms_px <= current.rms_px * 0.9);
+            if debug_enabled() {
+                eprintln!(
+                    "  [model] round {} (±{search_px:.0}px): {} line match(es), rms {:.2}px, sigma {:.2}m{}",
+                    round + 1,
+                    next.line_samples,
+                    next.rms_px,
+                    next.sigma_m,
+                    if better { "" } else { " (kept the previous fit)" }
+                );
+            }
+            if better {
+                ptz_station = Some(next);
+            } else {
+                break;
+            }
+        }
+    }
+
+    // One camera filmed this file, so every row carries the centre that was
+    // fitted for it. A frame whose own solve landed on the other side of the
+    // wall — which a lone tag allows, and which happened on Orlando — would
+    // otherwise be drawn from somewhere the camera never was, and the side of
+    // the field read from it would be read from the wrong end.
+    if let Some(fitted) = &ptz_station {
+        let (frames, views) = (&mut evaluated.frames, &evaluated.views);
+        for (index, (pose, frame_camera)) in fitted.views.iter().enumerate() {
+            let (Some(row), Some(view)) = (frames.get_mut(index), views.get(index)) else {
+                break;
+            };
+            row.adopt(pose);
+            row.rms_px = solve::reprojection_rms(pose, &view.corners, frame_camera);
+            if let Some(entry) = prepared
+                .iter()
+                .find(|entry| entry.time == row.time)
+                .filter(|_| pane == side::Pane::View)
+            {
+                let verdict = side::verdict(
+                    entry.alliance,
+                    entry.red_pixels,
+                    entry.blue_pixels,
+                    &row.tags,
+                    &layout,
+                    Some(pose),
+                );
+                row.side = Some(verdict);
+            }
+        }
+    }
+
+    let ptz_station = ptz_station.map(|fitted| report::PtzStationReport {
+        position: [fitted.position.x, fitted.position.y, fitted.position.z],
+        rms_px: fitted.rms_px,
+        model_frames: fitted.model_frames,
+        corner_samples: fitted.corner_samples,
+        line_samples: fitted.line_samples,
+        sigma_m: fitted.sigma_m,
+        frames_agreeing: fitted.frames_agreeing,
+        frames_stray: fitted.frames_stray,
+        frames_unexplained: fitted.frames_unexplained,
+        ambiguous: fitted.ambiguous,
+        frames: fitted
+            .views
+            .iter()
+            .zip(&evaluated.frames)
+            .map(|((pose, camera), frame)| report::PtzFrameReport {
+                time: frame.time,
+                rotation: [
+                    pose.rotation.w,
+                    pose.rotation.x,
+                    pose.rotation.y,
+                    pose.rotation.z,
+                ],
+                focal_px: camera.fx,
+            })
+            .collect(),
+    });
+
     Ok(PoseReport {
         video: video.to_path_buf(),
         tag_layout: layout.name.clone(),
@@ -466,6 +602,7 @@ pub fn estimate(video: &Path, options: &PoseOptions) -> Result<PoseReport> {
         tags_seen,
         min_confidence: options.min_confidence,
         station,
+        ptz_station,
     })
 }
 

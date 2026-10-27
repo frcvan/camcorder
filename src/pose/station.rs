@@ -63,6 +63,8 @@ pub(crate) struct View {
     pub pose: CameraPose,
     /// Tags those corners came from.
     pub tags: Vec<u16>,
+    /// Image samples associated with unambiguous field-model lines.
+    pub lines: Vec<solve::LineObservation>,
 }
 
 /// The camera's intrinsics for the whole video, and where they came from.
@@ -374,6 +376,333 @@ pub(crate) fn fit(
     })
 }
 
+/// How close two frames' own solved positions have to be to count as agreeing
+/// on the same camera. A fixed camera's frames scatter by their corner noise,
+/// which for a small tag is tens of centimetres; a different camera is metres.
+const CONSENSUS_RADIUS_M: f64 = 1.0;
+/// How far a joint refinement may move the centre from where the frames agree
+/// before it is not believed. A fit that wanders across the field has been
+/// captured by the handful of frames that fit its basin, not by the camera.
+const RUNAWAY_M: f64 = 3.0;
+/// Farthest displacement the uncertainty probe tests, metres. A position whose
+/// error bound reaches this is reported as "not pinned" rather than given a
+/// number that the footage cannot support.
+const PTZ_PROBE_M: f64 = 2.0;
+/// How many bisection steps turn the probe into a bound: 2m / 2^5 = 6cm.
+const PTZ_PROBE_STEPS: usize = 5;
+/// Squared reprojection error a displaced camera may add and still count as an
+/// explanation of the same footage. 0.5px per corner is the precision small
+/// broadcast tags actually carry.
+const PTZ_SLACK_PX2: f64 = 0.25;
+/// A centre not pinned any better than this is reported, but flagged.
+const PTZ_AMBIGUOUS_M: f64 = 0.5;
+
+/// A fixed centre and per-frame orientation and focal length. This is separate
+/// from the static-pose station fit: panning does not imply camera translation.
+#[derive(Debug, Clone)]
+pub(crate) struct PtzStation {
+    pub position: super::types::Vec3,
+    pub rms_px: f64,
+    /// Frames carrying at least one image-to-model line match.
+    pub model_frames: usize,
+    /// Tag corner observations the fit was based on.
+    pub corner_samples: usize,
+    /// Image-to-model line observations the fit was based on.
+    pub line_samples: usize,
+    /// Largest displacement the footage could not rule out, metres. Censored at
+    /// [`PTZ_PROBE_M`]. This is the honest width of the answer: a broadcast pane
+    /// holding one small tag leaves metres, and the report has to say so rather
+    /// than quote a centre to the centimetre.
+    pub sigma_m: f64,
+    /// Frames whose own solve put the camera within a metre of this centre: the
+    /// evidence the centre rests on. Note a lone tag solves as well from the far
+    /// side of the wall, so on a single-tag pane the frames split into two
+    /// basins and this counts only the one the answer came from.
+    pub frames_agreeing: usize,
+    /// Frames whose own solve put the camera somewhere else and which were
+    /// therefore re-aimed at this centre before being re-solved.
+    pub frames_stray: usize,
+    /// Frames the fitted camera still does not explain, after re-aiming.
+    pub frames_unexplained: usize,
+    /// Whether `sigma_m` is wide enough that the centre is not a measurement.
+    pub ambiguous: bool,
+    pub views: Vec<(CameraPose, Intrinsics)>,
+}
+
+/// Fit one camera centre to every frame, allowing each frame its own orientation
+/// and zoom, and report the best estimate together with what the footage could
+/// not rule out.
+///
+/// A fit is not rejected for being weak. On real broadcast panes the evidence is
+/// often a couple of small tags, and returning nothing there loses the one thing
+/// the run did measure; instead the answer ships with `sigma_m`, the largest
+/// displacement that still explains the pictures. Callers that need a real
+/// measurement must check `ambiguous`.
+///
+/// The probe has to re-optimize rotation and zoom at each displaced centre: the
+/// displacement can be absorbed by re-aiming, so a probe that held the other
+/// parameters fixed would report a precision the fit does not have.
+pub(crate) fn fit_ptz(
+    views: &[View],
+    camera: &Intrinsics,
+    layout: &TagLayout,
+    max_rms: f64,
+) -> Option<PtzStation> {
+    if views.len() < 2 {
+        return None;
+    }
+    // Where the frames independently say the camera was, and how many of them
+    // say it. A single tag is solved twice as well from the camera on the far
+    // side of the wall, so the per-frame answers split into basins; the camera
+    // is the basin most of the frames are in. Choosing by reprojection error
+    // instead lets two frames that agree with each other and disagree with the
+    // rest pull the answer into the empty middle of the field.
+    let (agreed, support) = consensus_position(views);
+    // A frame whose own solve put the camera somewhere else does not get to keep
+    // its orientation: that orientation was fitted from a position the camera was
+    // never at, so from the real centre it points nowhere useful — on Orlando it
+    // pointed away from the tag, leaving it behind the camera entirely. The
+    // nearest frame that did agree has an aim worth starting from, and the
+    // refinement below moves it onto the corners this frame actually saw.
+    let stray: Vec<bool> = views
+        .iter()
+        .map(|view| (view.pose.position - agreed).norm() > CONSENSUS_RADIUS_M)
+        .collect();
+    let seed_at = |position: super::types::Vec3| -> Vec<solve::PtzView> {
+        views
+            .iter()
+            .enumerate()
+            .map(|(index, view)| solve::PtzView {
+                corners: view.corners.clone(),
+                lines: view.lines.clone(),
+                pose: CameraPose {
+                    position,
+                    rotation: if stray[index] {
+                        nearby_aim(views, &stray, view.pose.position).unwrap_or(view.pose.rotation)
+                    } else {
+                        view.pose.rotation
+                    },
+                },
+                camera: *camera,
+            })
+            .collect()
+    };
+
+    // Refine the centre as well as each frame's aim and zoom — but only believe a
+    // refinement that stays where the frames put it. Otherwise the centre is
+    // held at the agreement and only the aims and zoom are fitted.
+    let refined = solve::refine_ptz(&seed_at(agreed), false)
+        .filter(|fitted| {
+            (fitted[0].pose.position - agreed).norm() <= RUNAWAY_M
+                && fitted[0].pose.position.z >= 0.0
+        })
+        .filter(|fitted| !implausible(fitted, views, camera, layout));
+    let fitted = match refined {
+        Some(fitted) => fitted,
+        None => {
+            let fixed = solve::refine_ptz(&seed_at(agreed), true);
+            let held = fixed.filter(|fitted| !implausible(fitted, views, camera, layout))?;
+            if super::debug_enabled() {
+                eprintln!(
+                    "  [fixed] refinement ran away from the frames' agreement at ({:.2}, {:.2}, {:.2})m; holding the centre",
+                    agreed.x, agreed.y, agreed.z
+                );
+            }
+            held
+        }
+    };
+    if super::debug_enabled() {
+        eprintln!(
+            "  [fixed] {} frame(s): {support} agree on ({:.2}, {:.2}, {:.2})m, fitted ({:.2}, {:.2}, {:.2})m at rms {:.2}px",
+            views.len(),
+            agreed.x, agreed.y, agreed.z,
+            fitted[0].pose.position.x, fitted[0].pose.position.y, fitted[0].pose.position.z,
+            ptz_rms(&fitted)
+        );
+    }
+    let rms = ptz_rms(&fitted);
+    if !rms.is_finite() {
+        return None;
+    }
+    // Frames the fitted camera still cannot explain are counted rather than
+    // quietly kept: they are frames whose own solve was on the other branch, and
+    // if re-aiming at the real centre did not bring them back, the honest answer
+    // is that this run does not know where those frames were taken from.
+    let unexplained = fitted
+        .iter()
+        .filter(|view| {
+            let (cost, count) = solve::ptz_error(view);
+            (cost / count.max(1) as f64).sqrt() > max_rms
+        })
+        .count();
+    let centre = fitted[0].pose.position;
+    let tolerance = rms * rms + PTZ_SLACK_PX2;
+
+    let mut sigma = 0.0f64;
+    let directions = probe_directions();
+    for direction in directions {
+        let bound = displacement_bound(&fitted, centre, direction, tolerance);
+        if bound > sigma {
+            sigma = bound;
+        }
+        if sigma >= PTZ_PROBE_M {
+            break;
+        }
+    }
+    let sigma_m = sigma.min(PTZ_PROBE_M);
+
+    let corner_samples = fitted.iter().map(|view| view.corners.len()).sum::<usize>();
+    let line_samples = fitted
+        .iter()
+        .map(|view| view.lines.len().min(4))
+        .sum::<usize>();
+    Some(PtzStation {
+        position: centre,
+        rms_px: rms,
+        model_frames: fitted.iter().filter(|view| !view.lines.is_empty()).count(),
+        corner_samples,
+        line_samples,
+        sigma_m,
+        frames_agreeing: support,
+        frames_stray: stray.iter().filter(|stray| **stray).count(),
+        frames_unexplained: unexplained,
+        // A fit that does not even reproject the frames within the run's own
+        // error limit is a best estimate, not a measurement, however tight the
+        // displacement probe looks around it.
+        ambiguous: sigma_m >= PTZ_AMBIGUOUS_M || rms > max_rms || unexplained > 0,
+        views: fitted.iter().map(|view| (view.pose, view.camera)).collect(),
+    })
+}
+
+/// Where most of the frames put the camera, and how many put it there.
+///
+/// The candidate is each frame's own solved centre in turn; the winner is the
+/// one with the most other frames within [`CONSENSUS_RADIUS_M`], and the answer
+/// is the mean of that group. A mean over a majority is what makes this robust
+/// where a joint fit is not: agreement is counted, so two frames that agree with
+/// each other cannot outvote ten that agree on somewhere else, however well
+/// those two reproject.
+/// The aim of the nearest frame that agreed with the centre, for re-solving a
+/// frame that landed elsewhere.
+fn nearby_aim(
+    views: &[View],
+    stray: &[bool],
+    from: super::types::Vec3,
+) -> Option<super::types::Quat> {
+    views
+        .iter()
+        .zip(stray)
+        .filter(|(_, stray)| !**stray)
+        .min_by(|(a, _), (b, _)| {
+            (a.pose.position - from)
+                .norm()
+                .total_cmp(&(b.pose.position - from).norm())
+        })
+        .map(|(view, _)| view.pose.rotation)
+}
+
+fn consensus_position(views: &[View]) -> (super::types::Vec3, usize) {
+    let mut best = (views[0].pose.position, 0usize);
+    for view in views {
+        let agreeing: Vec<super::types::Vec3> = views
+            .iter()
+            .map(|other| other.pose.position)
+            .filter(|other| (*other - view.pose.position).norm() <= CONSENSUS_RADIUS_M)
+            .collect();
+        if agreeing.len() > best.1 {
+            let centre = agreeing
+                .iter()
+                .fold(super::types::Vec3::new(0.0, 0.0, 0.0), |sum, p| sum + *p)
+                * (1.0 / agreeing.len() as f64);
+            best = (centre, agreeing.len());
+        }
+    }
+    best
+}
+
+/// Whether any frame's fitted pose is one no camera could have had, or a lens no
+/// camera has. Returns the reason for the report's debug output.
+fn implausible(
+    fitted: &[solve::PtzView],
+    views: &[View],
+    camera: &Intrinsics,
+    layout: &TagLayout,
+) -> bool {
+    fitted.iter().zip(views).any(|(view, original)| {
+        trust::plausible(&view.pose, layout, &original.tags).is_err()
+            || view.camera.fx < camera.fx * FOCAL_RANGE.0
+            || view.camera.fx > camera.fx * FOCAL_RANGE.1
+    })
+}
+
+/// The directions the centre is pushed to find what the footage rules out: six
+/// axes and the four space diagonals, so a slope no axis test can see is caught.
+fn probe_directions() -> Vec<super::types::Vec3> {
+    use super::types::Vec3;
+    let d = 1.0 / 3.0f64.sqrt();
+    vec![
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(-1.0, 0.0, 0.0),
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec3::new(0.0, -1.0, 0.0),
+        Vec3::new(0.0, 0.0, 1.0),
+        Vec3::new(0.0, 0.0, -1.0),
+        Vec3::new(d, d, d),
+        Vec3::new(d, d, -d),
+        Vec3::new(d, -d, d),
+        Vec3::new(-d, d, d),
+    ]
+}
+
+/// The farthest the centre can move along `direction` and still explain the
+/// frames, by bisection between "no displacement" (which always fits, being the
+/// fit itself) and [`PTZ_PROBE_M`]. Returns the probe distance when even that far
+/// is not ruled out — the answer is then "more than this", and the caller
+/// censors it.
+fn displacement_bound(
+    fitted: &[solve::PtzView],
+    centre: super::types::Vec3,
+    direction: super::types::Vec3,
+    tolerance: f64,
+) -> f64 {
+    let fits_within = |distance: f64| -> bool {
+        let mut displaced = fitted.to_vec();
+        for view in &mut displaced {
+            view.pose.position = centre + direction * distance;
+        }
+        match solve::refine_ptz(&displaced, true) {
+            Some(alternative) => ptz_rms(&alternative) <= tolerance.sqrt(),
+            // A displaced pose that will not even optimize is not evidence that
+            // the displacement is wrong, so it does not narrow the bound.
+            None => false,
+        }
+    };
+    if fits_within(PTZ_PROBE_M) {
+        return PTZ_PROBE_M;
+    }
+    let (mut low, mut high) = (0.0f64, PTZ_PROBE_M);
+    for _ in 0..PTZ_PROBE_STEPS {
+        let middle = 0.5 * (low + high);
+        if fits_within(middle) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    low
+}
+
+fn ptz_rms(views: &[solve::PtzView]) -> f64 {
+    let mut cost = 0.0;
+    let mut count = 0;
+    for view in views {
+        let (error, samples) = solve::ptz_error(view);
+        cost += error;
+        count += samples;
+    }
+    (cost / count.max(1) as f64).sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,6 +765,251 @@ mod tests {
     }
 
     #[test]
+    fn fixed_position_survives_pan_and_zoom_when_geometry_constrains_it() {
+        let layout = test_layout(&[
+            facing_tag(3, Vec3::new(3.0, 6.0, 0.5)),
+            facing_tag(4, Vec3::new(9.0, 6.0, 0.5)),
+            facing_tag(5, Vec3::new(5.0, 6.0, 2.5)),
+        ]);
+        let assumed = Intrinsics::from_horizontal_fov(1920, 1080, 65.0);
+        let position = Vec3::new(2.0, 1.0, 4.0);
+        let views: Vec<View> = [(4.0, 50.0), (6.0, 65.0), (8.0, 80.0)]
+            .into_iter()
+            .map(|(target, fov)| {
+                let pose = look_at(position, Vec3::new(target, 6.0, 0.5));
+                let camera = Intrinsics::from_horizontal_fov(1920, 1080, fov);
+                View {
+                    corners: corners_of(&layout, &[3, 4, 5], 0.1651, pose, &camera),
+                    pose,
+                    tags: vec![3, 4, 5],
+                    lines: vec![],
+                }
+            })
+            .collect();
+        let fitted = fit_ptz(&views, &assumed, &layout, 8.0).expect("well-constrained camera");
+        assert!((fitted.position - position).norm() < 0.05);
+        assert!(
+            !fitted.ambiguous,
+            "three tags across three zoom levels should pin the centre, got ±{:.1}m",
+            fitted.sigma_m
+        );
+        for ((_, camera), fov) in fitted.views.iter().zip([50.0, 65.0, 80.0]) {
+            let truth = Intrinsics::from_horizontal_fov(1920, 1080, fov);
+            assert!((camera.fx - truth.fx).abs() / truth.fx < 0.01);
+        }
+    }
+
+    #[test]
+    fn small_single_tags_do_not_claim_a_measured_fixed_centre() {
+        let layout = test_layout(&[facing_tag(3, Vec3::new(6.0, 6.0, 0.5))]);
+        let camera = Intrinsics::from_horizontal_fov(640, 360, 60.0);
+        let position = Vec3::new(2.0, -8.0, 4.0);
+        let views: Vec<View> = [5.5, 6.0, 6.5]
+            .into_iter()
+            .map(|target| {
+                let pose = look_at(position, Vec3::new(target, 6.0, 0.5));
+                View {
+                    corners: corners_of(&layout, &[3], 0.1651, pose, &camera),
+                    pose,
+                    tags: vec![3],
+                    lines: vec![],
+                }
+            })
+            .collect();
+        // The answer is still reported — the run did fit something — but it has
+        // to say that a camera metres away explains the same pixels, which is
+        // what happens when one small tag is the whole picture. Quoting this
+        // centre as a position would be the mistake the flag exists to prevent.
+        let fitted = fit_ptz(&views, &camera, &layout, 8.0).expect("a fit is still reported");
+        assert!(
+            fitted.ambiguous,
+            "one small tag pinned the centre to ±{:.2}m, which it cannot",
+            fitted.sigma_m
+        );
+        assert!(fitted.sigma_m >= super::PTZ_AMBIGUOUS_M);
+    }
+
+    /// The model's structure box for a tag, as field-coordinate edges.
+    fn structure_segments(id: u16) -> Vec<[[f64; 3]; 2]> {
+        #[derive(serde::Deserialize)]
+        struct Entry {
+            id: u16,
+            segments: Vec<[[f64; 3]; 2]>,
+        }
+        let entries: Vec<Entry> = serde_json::from_str(include_str!(
+            "../../assets/field/2026-rebuilt-advantagescope/structure.json"
+        ))
+        .expect("the bundled structure parses");
+        entries
+            .into_iter()
+            .find(|entry| entry.id == id)
+            .expect("the tag has structure")
+            .segments
+    }
+
+    #[test]
+    fn a_frame_solved_to_the_other_side_of_the_wall_is_re_aimed_at_the_camera() {
+        // Four frames of one fixed camera watching one small tag. Three solved
+        // where the camera was; the fourth, whose four corners fit equally well
+        // from the far side of the wall, landed at the field centre instead —
+        // which is what happened on Orlando, where two broadcast panes came back
+        // with their cameras in the middle of the field. The camera is where the
+        // frames agree, not where the best reprojection is: one frame must not
+        // be able to move it, and the stray frame is re-aimed at the real centre
+        // rather than left pointing at nothing.
+        let layout = TagLayout::load("2026-rebuilt-welded").expect("the bundled layout");
+        let tag = layout.tag(5).expect("tag 5 is in the layout");
+        let normal = Mat3::from_quaternion(tag.rotation).mul_vec(Vec3::new(1.0, 0.0, 0.0));
+        let truth_position = tag.translation + normal * 9.0 + Vec3::new(0.0, 0.0, 6.0);
+        let assumed = Intrinsics::from_horizontal_fov(1280, 720, 60.0);
+
+        let mut views = Vec::new();
+        for offset in [-1.5, 0.0, 1.5] {
+            let camera = Intrinsics::from_horizontal_fov(1280, 720, 60.0);
+            let pose = look_at(
+                truth_position,
+                Vec3::new(
+                    tag.translation.x,
+                    tag.translation.y + offset,
+                    tag.translation.z,
+                ),
+            );
+            views.push(View {
+                corners: corners_of(&layout, &[5], 0.1651, pose, &camera),
+                pose,
+                tags: vec![5],
+                lines: Vec::new(),
+            });
+        }
+        // The same camera, but this frame's solve picked the other branch: the
+        // corners are the ones the camera really saw, the pose is not. Its aim
+        // points the wrong way from the real centre — on Orlando those frames
+        // ended up with the tag *behind* the camera — so keeping that aim and
+        // only moving the centre cannot explain the frame, which is what makes
+        // re-aiming it from a frame that did agree the necessary step.
+        // The aim is the part that matters: from the real centre it points
+        // straight away from the tag, the way the Orlando strays did. There the
+        // tag is behind the camera, and the solver's residual for a point behind
+        // it is a flat penalty — no slope to descend — so moving the centre
+        // alone leaves the frame unexplained forever.
+        let away = look_at(truth_position, truth_position + normal * 10.0);
+        views.push(View {
+            corners: views[1].corners.clone(),
+            pose: CameraPose {
+                position: Vec3::new(8.0, 0.0, 2.3),
+                rotation: away.rotation,
+            },
+            tags: vec![5],
+            lines: Vec::new(),
+        });
+
+        let station = fit_ptz(&views, &assumed, &layout, 8.0).expect("a fit is reported");
+        let error = (station.position - truth_position).norm();
+        assert!(
+            error < 0.25,
+            "the stray frame moved the camera {error:.2}m off, to ({:.2}, {:.2}, {:.2})",
+            station.position.x,
+            station.position.y,
+            station.position.z
+        );
+        assert_eq!(station.frames_agreeing, 3);
+        assert_eq!(station.frames_stray, 1);
+        assert_eq!(
+            station.frames_unexplained, 0,
+            "the stray frame's corners are the camera's own and must be explained from it"
+        );
+        // …and every frame now carries the one centre the camera stood at.
+        for (pose, _) in &station.views {
+            assert!((pose.position - station.position).norm() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn the_structure_of_a_small_tag_is_what_fixes_the_camera() {
+        // One 16cm tag, eleven metres away, in three frames of a panning and
+        // zooming camera. Its four corners are all the same plane and all the
+        // same size-to-distance ratio, so a camera further down the view ray
+        // with a longer lens reproduces them, and the fit is flat along that
+        // ray. The structure the tag is bolted to is not on that plane: when the
+        // camera moves, the top of the mount sweeps across the picture. That is
+        // what these observations add, and without them the run has to say so.
+        let layout = TagLayout::load("2026-rebuilt-welded").expect("the bundled layout");
+        // Tag 5 stands on the three-metre structure at the red end of the field,
+        // which is the kind of thing a broadcast pane actually shows: the tag
+        // itself is a few pixels, the tower it is bolted to is not.
+        let segments = structure_segments(5);
+        assert!(segments.len() >= 8, "a box outline, got {}", segments.len());
+        let tag = layout.tag(5).expect("tag 5 is in the layout");
+        let aim = tag.translation;
+        // Stand where the tag can actually be read: out along the front of its
+        // face, up where a fixed camera on a stand would be.
+        let normal = Mat3::from_quaternion(tag.rotation).mul_vec(Vec3::new(1.0, 0.0, 0.0));
+        let truth_position = aim + normal * 9.0 + Vec3::new(0.0, 0.0, 6.0);
+        let assumed = Intrinsics::from_horizontal_fov(1280, 720, 60.0);
+
+        let mut plain = Vec::new();
+        let mut with_model = Vec::new();
+        for (offset, fov) in [(-1.5, 55.0), (0.0, 60.0), (1.5, 70.0)] {
+            let camera = Intrinsics::from_horizontal_fov(1280, 720, fov);
+            let pose = look_at(truth_position, Vec3::new(aim.x, aim.y + offset, aim.z));
+            let corners = corners_of(&layout, &[5], 0.1651, pose, &camera);
+            assert!(
+                corners.len() == 4,
+                "one tag should give four corners, got {}",
+                corners.len()
+            );
+            let lines: Vec<solve::LineObservation> = segments
+                .iter()
+                .filter_map(|segment| {
+                    let start = Vec3::from_array(segment[0]);
+                    let end = Vec3::from_array(segment[1]);
+                    let middle = start + (end - start) * 0.5;
+                    let image = camera.project(pose.to_camera(middle))?;
+                    Some(solve::LineObservation { start, end, image })
+                })
+                .collect();
+            assert!(!lines.is_empty(), "the structure should project into shot");
+            plain.push(View {
+                corners: corners.clone(),
+                pose,
+                tags: vec![5],
+                lines: Vec::new(),
+            });
+            with_model.push(View {
+                corners,
+                pose,
+                tags: vec![5],
+                lines,
+            });
+        }
+
+        let tags_only = fit_ptz(&plain, &assumed, &layout, 8.0).expect("a fit is reported");
+        assert!(
+            tags_only.ambiguous,
+            "one small tag pinned the camera to ±{:.2}m on its own, which one tag cannot do",
+            tags_only.sigma_m
+        );
+
+        let pinned = fit_ptz(&with_model, &assumed, &layout, 8.0).expect("a fit is reported");
+        assert!(
+            !pinned.ambiguous,
+            "the structure should fix the camera, still ±{:.2}m ({} line sample(s))",
+            pinned.sigma_m, pinned.line_samples
+        );
+        assert!(
+            pinned.sigma_m < tags_only.sigma_m,
+            "structure knowledge left the bound no tighter: {:.2}m against {:.2}m",
+            pinned.sigma_m,
+            tags_only.sigma_m
+        );
+        let error = (pinned.position - truth_position).norm();
+        assert!(
+            error < 0.25,
+            "structural evidence left the camera {error:.2}m from where it was"
+        );
+    }
+
+    #[test]
     fn two_tags_measure_the_focal_length_the_assumed_one_got_wrong() {
         // A 1920-wide frame at 55° is 1841px. If the run was told 75°, it would
         // assume 1253px and put every pose 40% too close. The tag pair is the
@@ -454,6 +1028,7 @@ mod tests {
                 corners: corners.clone(),
                 pose,
                 tags: vec![3, 4],
+                lines: vec![],
             })
             .collect();
         let calibration = calibrate(&views, assumed);
@@ -503,6 +1078,7 @@ mod tests {
                 ),
                 pose,
                 tags: vec![3, 4],
+                lines: vec![],
             })
             .collect();
         for view in &views {
@@ -539,6 +1115,7 @@ mod tests {
             corners: corners_of(&layout, &[3, 4], 0.1651, pose, &truth),
             pose,
             tags: vec![3, 4],
+            lines: vec![],
         }];
 
         let calibration = calibrate(&views, assumed);
@@ -568,6 +1145,7 @@ mod tests {
                 corners: corners.clone(),
                 pose,
                 tags: vec![3, 4],
+                lines: vec![],
             })
             .collect();
 
@@ -592,6 +1170,7 @@ mod tests {
             corners: corners_of(&layout, &[13], 0.1651, pose, &truth),
             pose,
             tags: vec![13],
+            lines: vec![],
         }];
         let assumed = Intrinsics::from_horizontal_fov(1280, 720, 45.0);
         let calibration = calibrate(&views, assumed);
@@ -628,6 +1207,7 @@ mod tests {
                 corners,
                 pose: solution.pose,
                 tags: vec![3, 4],
+                lines: vec![],
             });
         }
 
@@ -642,6 +1222,7 @@ mod tests {
             corners: stray,
             pose: elsewhere,
             tags: vec![3, 4],
+            lines: vec![],
         });
 
         let station = fit(&views, &camera, &layout, 8.0).expect("a station");
@@ -669,6 +1250,7 @@ mod tests {
                 corners: corners_of(&layout, &[3, 4], 0.1651, pose, &camera),
                 pose,
                 tags: vec![3, 4],
+                lines: vec![],
             })
             .collect();
         let station = fit(&views, &camera, &layout, 8.0).expect("majority camera");
@@ -691,6 +1273,7 @@ mod tests {
                 corners: corners.clone(),
                 pose,
                 tags: vec![3],
+                lines: vec![],
             })
             .collect();
         let station = fit(&views, &camera, &layout, 8.0).expect("majority camera");
@@ -708,6 +1291,7 @@ mod tests {
             corners,
             pose,
             tags: vec![13],
+            lines: vec![],
         }];
         let station = fit(&views, &camera, &layout, 8.0).expect("a station");
         assert_eq!(station.frames_used, 1);

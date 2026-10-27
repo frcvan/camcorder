@@ -47,6 +47,7 @@ import rerun as rr
 DEFAULT_TAG_SIZE_M = 0.1651
 #: Where the layouts that ship with camcorder live, relative to the repo root.
 DEFAULT_LAYOUT_DIR = Path(__file__).resolve().parent.parent / "assets" / "tags"
+DEFAULT_2026_MODEL = DEFAULT_LAYOUT_DIR.parent / "field" / "2026-rebuilt-advantagescope" / "model.glb"
 #: Tags are thin, but not flat: give them a little depth so they are visible
 #: edge-on in the viewer.
 TAG_THICKNESS_M = 0.005
@@ -226,6 +227,15 @@ def log_world(cameras: list[Camera], tag_size: float) -> None:
                     [0.0, 0.0, 0.0],
                 ]
             )
+            if name == "2026-rebuilt-welded" and DEFAULT_2026_MODEL.is_file():
+                # glTF X,Y,Z -> field -X,Z,Y, translated from the centre to
+                # WPILib's blue-wall origin. This is a proper rotation.
+                entity = f"world/{name}/field/model"
+                rr.log(entity, rr.Transform3D(
+                    translation=[length / 2, width / 2, 0.0],
+                    mat3x3=[[-1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]],
+                ), static=True)
+                rr.log(entity, rr.Asset3D(path=DEFAULT_2026_MODEL), static=True)
             rr.log(
                 f"world/{name}/field/outline",
                 rr.LineStrips3D([corners], colors=[(120, 120, 120)], radii=0.02),
@@ -566,6 +576,19 @@ def log_station(camera: Camera) -> None:
     that really did pan has to keep showing as having panned, and this is the
     consensus it panned away from.
     """
+    ptz = camera.report.get("ptz_station")
+    if ptz:
+        rr.log(
+            f"world/ptz_stations/{camera.name}",
+            rr.Points3D(
+                [[float(value) for value in ptz["position"]]],
+                colors=[(120, 255, 140)],
+                radii=0.1,
+                labels=[f"{camera.name} fixed position: {len(ptz['frames'])} frames, "
+                        f"{ptz['model_frames']} model-matched, rms {float(ptz['rms_px']):.1f}px"],
+            ),
+            static=True,
+        )
     station = camera.report.get("station")
     if not station:
         return
@@ -588,9 +611,13 @@ def log_station(camera: Camera) -> None:
 def usable(frame: dict, min_height: float | None) -> bool:
     """Whether a frame's pose is physically possible.
 
-    A single tag leaves a mirror ambiguity, and the mirrored branch is sometimes
-    the one that fits best. It puts the camera below the carpet, which no camera
-    ever was, so a height floor removes it without touching the good frames.
+    This is the viewer's own copy of a gate the estimator already applies: a
+    camera below the carpet is not a camera. It is deliberately no stricter than
+    that. It used to default to half a metre, on the theory that the mirrored
+    branch sits underground, and on real broadcast footage that threw away the
+    correct pose instead: the Orlando panes stand at 0.28m and 0.43m, so every
+    frame of both was dropped and the viewer showed only the frames that had
+    solved to the wrong branch — a camera in the middle of the field.
     """
     if min_height is None:
         return True
@@ -708,11 +735,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--min-height",
         type=float,
-        default=0.5,
+        default=0.0,
         metavar="M",
-        help="skip frames whose camera is below M metres (default: 0.5, which "
-        "drops the mirror solution a single tag allows; use a negative value "
-        "to keep everything)",
+        help="skip frames whose camera is below M metres (default: 0.0, which "
+        "drops only the poses below the carpet; raise it to hide low cameras "
+        "as well, or use a negative value to keep everything)",
     )
     parser.add_argument(
         "--layout-dir",

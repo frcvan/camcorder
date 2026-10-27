@@ -610,6 +610,253 @@ pub(crate) fn refine(
     })
 }
 
+/// A pixel on a known 3D line, with its position along that line unknown.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LineObservation {
+    pub start: Vec3,
+    pub end: Vec3,
+    pub image: (f64, f64),
+}
+
+/// One observation of a fixed camera, with independent orientation and focal length.
+#[derive(Clone)]
+pub(crate) struct PtzView {
+    pub corners: Vec<Correspondence>,
+    pub lines: Vec<LineObservation>,
+    pub pose: CameraPose,
+    pub camera: Intrinsics,
+}
+
+/// Jointly refine a shared camera centre and each frame's rotation and zoom.
+/// The block normal equations eliminate each frame's four local parameters so
+/// the system remains small regardless of the number of sampled frames.
+/// A dense solve that gives up on the smallest of the systems here by returning
+/// no step at all, so one unconstrained direction cannot abort a fit that is
+/// fine in every other direction.
+fn solve_or_zero<const N: usize>(matrix: [[f64; N]; N], rhs: [f64; N]) -> [f64; N] {
+    solve_dense(matrix, rhs).unwrap_or([0.0; N])
+}
+
+/// Damping for one diagonal entry. Levenberg's `lambda` times the entry itself
+/// is the usual choice, but it does nothing for an entry that is *zero* — a
+/// direction the footage has no opinion about — leaving the block singular. The
+/// floor is a fraction of the block's largest entry, so a direction nothing
+/// constrains stays unconstrained instead of picking up an arbitrary step.
+fn damping(lambda: f64, entry: f64, scale: f64) -> f64 {
+    lambda * entry.abs().max(scale * 1e-6).max(1e-12)
+}
+
+pub(crate) fn refine_ptz(views: &[PtzView], fixed_position: bool) -> Option<Vec<PtzView>> {
+    if views.is_empty() || views.iter().any(|view| view.corners.len() < 4) {
+        return None;
+    }
+    let mut result = views.to_vec();
+    let mut position = views[0].pose.position;
+    for view in &mut result {
+        view.pose.position = position;
+    }
+    let cost = |views: &[PtzView]| -> f64 {
+        views
+            .iter()
+            .flat_map(|view| {
+                ptz_residuals(
+                    Mat3::from_quaternion(view.pose.rotation),
+                    view.pose.position,
+                    view,
+                    &view.camera,
+                )
+            })
+            .map(|x| x * x)
+            .sum()
+    };
+    let mut current = cost(&result);
+    let initial = current;
+    let mut accepted = 0usize;
+    let mut lambda = 1e-3;
+    for _ in 0..80 {
+        let mut global = [[0.0; 3]; 3];
+        let mut gradient = [0.0; 3];
+        let mut blocks = Vec::with_capacity(result.len());
+        for view in &result {
+            let rotation = Mat3::from_quaternion(view.pose.rotation);
+            let base = ptz_residuals(rotation, position, view, &view.camera);
+            let mut jac = vec![[0.0; 7]; base.len()];
+            for (axis, step) in [1e-6_f64; 7].into_iter().enumerate() {
+                let mut camera = view.camera;
+                let mut rot = rotation;
+                let mut pos = position;
+                if axis < 3 {
+                    pos = shift(pos, axis, step);
+                } else if axis < 6 {
+                    rot = delta_rotation(axis - 3, step).mul_mat(&rot);
+                } else {
+                    camera.fx *= step.exp();
+                    camera.fy *= step.exp();
+                }
+                let shifted = ptz_residuals(rot, pos, view, &camera);
+                for row in 0..base.len() {
+                    jac[row][axis] = (shifted[row] - base[row]) / step;
+                }
+            }
+            let mut normal = [[0.0; 7]; 7];
+            let mut g = [0.0; 7];
+            for (row, value) in jac.iter().zip(&base) {
+                for i in 0..7 {
+                    g[i] += row[i] * value;
+                    for j in 0..7 {
+                        normal[i][j] += row[i] * row[j];
+                    }
+                }
+            }
+            for i in 0..3 {
+                gradient[i] += g[i];
+                for j in 0..3 {
+                    global[i][j] += normal[i][j];
+                }
+            }
+            let local_scale = (3..7).map(|i| normal[i][i].abs()).fold(0.0f64, f64::max);
+            let mut local = [[0.0; 4]; 4];
+            let mut cross = [[0.0; 4]; 3];
+            let mut local_g = [0.0; 4];
+            for i in 0..4 {
+                local_g[i] = g[i + 3];
+                for j in 0..4 {
+                    local[i][j] = normal[i + 3][j + 3];
+                }
+                local[i][i] += damping(lambda, local[i][i], local_scale);
+                for j in 0..3 {
+                    cross[j][i] = normal[j][i + 3];
+                }
+            }
+            blocks.push((local, cross, local_g));
+        }
+        let global_scale = (0..3).map(|i| global[i][i].abs()).fold(0.0f64, f64::max);
+        for (i, row) in global.iter_mut().enumerate() {
+            row[i] += damping(lambda, row[i], global_scale);
+        }
+        let mut reduced = global;
+        let mut reduced_g = gradient;
+        for (local, cross, local_g) in &blocks {
+            // A frame whose own block will not solve is dropped from the shared
+            // system rather than ending the fit. The cost test below is what
+            // decides whether the resulting step was worth taking.
+            let inv_g = solve_or_zero(*local, *local_g);
+            for i in 0..3 {
+                reduced_g[i] -= (0..4).map(|k| cross[i][k] * inv_g[k]).sum::<f64>();
+                for j in 0..3 {
+                    let inv_cross = solve_or_zero(*local, cross[j]);
+                    reduced[i][j] -= (0..4).map(|k| cross[i][k] * inv_cross[k]).sum::<f64>();
+                }
+            }
+        }
+        // The shared centre's normal block is singular exactly when the footage
+        // does not pin it — which is the case this whole pass exists to report
+        // rather than to give up on. The step is dropped and the fixed centre
+        // kept when it cannot be solved; the caller's displacement probe is what
+        // says how loose that leaves the answer.
+        let dp = if fixed_position {
+            [0.0; 3]
+        } else {
+            solve_dense(reduced, reduced_g.map(|v| -v)).unwrap_or([0.0; 3])
+        };
+        let mut candidate = result.clone();
+        let next_position = position + Vec3::from_array(dp);
+        let mut step_size = dp.iter().map(|v| v * v).sum::<f64>();
+        for (view, (local, cross, local_g)) in candidate.iter_mut().zip(&blocks) {
+            let mut rhs = local_g.map(|v| -v);
+            for i in 0..4 {
+                for j in 0..3 {
+                    rhs[i] -= cross[j][i] * dp[j];
+                }
+            }
+            let Some(step) = solve_dense(*local, rhs) else {
+                continue;
+            };
+            // A focal-length step of e^2 would be a different lens, not a
+            // refinement: clamp it and let the cost decide, rather than throwing
+            // the whole fit away over one frame's wild step.
+            let focal_step = step[3].clamp(-0.5, 0.5);
+            step_size +=
+                step[0] * step[0] + step[1] * step[1] + step[2] * step[2] + focal_step * focal_step;
+            let rotation = delta_rotation_vector([step[0], step[1], step[2]])
+                .mul_mat(&Mat3::from_quaternion(view.pose.rotation))
+                .orthonormalized();
+            view.pose = CameraPose {
+                position: next_position,
+                rotation: rotation.to_quaternion(),
+            };
+            view.camera.fx *= focal_step.exp();
+            view.camera.fy *= focal_step.exp();
+        }
+        let next = cost(&candidate);
+        if next.is_finite() && next < current {
+            result = candidate;
+            position = next_position;
+            current = next;
+            accepted += 1;
+            lambda = (lambda * 0.3).max(1e-9);
+            if step_size < 1e-16 {
+                break;
+            }
+        } else {
+            lambda *= 10.0;
+            if lambda > 1e12 {
+                break;
+            }
+        }
+    }
+    // A fit that took no acceptable step is the one worth printing: it means the
+    // seed was already a local minimum, or the frames do not agree on a camera.
+    if super::debug_enabled() && accepted == 0 {
+        let _ = (initial, current);
+        eprintln!("  [ptz] no step improved on the seed, cost {current:.1}");
+    }
+    Some(result)
+}
+
+/// Model-line samples one frame contributes at most, in equivalent independent
+/// pixels. Samples along one edge are strongly correlated, so a long line cannot
+/// outvote the tag corners by sheer count — but the cap has to leave a tag's
+/// whole mount outline counting for something: at four it was outvoted, and the
+/// ambiguity a lone small tag leaves survived it.
+pub(crate) const LINE_WEIGHT_CAP: usize = 8;
+
+fn ptz_residuals(rotation: Mat3, position: Vec3, view: &PtzView, camera: &Intrinsics) -> Vec<f64> {
+    let mut out = residuals(rotation, position, &view.corners, camera);
+    let weight = (LINE_WEIGHT_CAP as f64 / view.lines.len().max(LINE_WEIGHT_CAP) as f64).sqrt();
+    for line in &view.lines {
+        let a = camera.project(rotation.mul_vec(line.start - position));
+        let b = camera.project(rotation.mul_vec(line.end - position));
+        let error = if let (Some(a), Some(b)) = (a, b) {
+            let dx = b.0 - a.0;
+            let dy = b.1 - a.1;
+            let length = dx.hypot(dy);
+            if length > 1e-9 {
+                (dx * (line.image.1 - a.1) - dy * (line.image.0 - a.0)) / length
+            } else {
+                camera.width as f64 + camera.height as f64
+            }
+        } else {
+            camera.width as f64 + camera.height as f64
+        };
+        out.push(error * weight);
+    }
+    out
+}
+
+pub(crate) fn ptz_error(view: &PtzView) -> (f64, usize) {
+    let values = ptz_residuals(
+        Mat3::from_quaternion(view.pose.rotation),
+        view.pose.position,
+        view,
+        &view.camera,
+    );
+    (
+        values.iter().map(|v| v * v).sum(),
+        view.corners.len() + view.lines.len().min(LINE_WEIGHT_CAP),
+    )
+}
+
 fn residuals(
     rotation: Mat3,
     position: Vec3,
