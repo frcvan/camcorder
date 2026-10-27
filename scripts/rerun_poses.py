@@ -303,8 +303,16 @@ def cluster_frames(
     return clusters
 
 
-def log_camera_static(entity: str, camera: Camera) -> None:
+def log_camera_pinhole(entity: str, camera: Camera, first_time: float) -> None:
+    """Show a frustum only once its first measured transform exists.
+
+    A static pinhole appears at the origin before the first time-varying pose,
+    which looks like a camera pointing up from the field even though no pose was
+    measured yet. Do not invent a pose for that earlier footage.
+    """
     fx, cx, cy, width, height = camera.intrinsics()
+    rr.set_time("video_time", duration=first_time)
+    rr.set_time("frame", sequence=int(first_time * 1000))
     rr.log(
         f"{entity}/image",
         rr.Pinhole(
@@ -315,7 +323,6 @@ def log_camera_static(entity: str, camera: Camera) -> None:
             camera_xyz=rr.ViewCoordinates.RDF,
             image_plane_distance=2.0,
         ),
-        static=True,
     )
 
 
@@ -339,39 +346,20 @@ def log_trajectory(name: str, clusters: list[list[dict]]) -> None:
     )
 
 
-def video_fps(video: Path) -> float:
-    """The video's average frame rate, or 30 when ffprobe will not say.
-
-    Every frame of the video is decoded, so the times have to come from the
-    frame rate rather than from the report: the report samples a handful of
-    frames, and the recording now holds all of them.
-    """
+def video_times(video: Path) -> list[float]:
+    """Presentation timestamps relative to the input's start, including VFR gaps."""
     command = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "stream=r_frame_rate",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        str(video),
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_frames", "-show_entries",
+        "frame=best_effort_timestamp_time:format=start_time", "-of", "json", str(video),
     ]
-    try:
-        output = subprocess.run(command, capture_output=True, check=False, text=True)
-    except FileNotFoundError:
-        return 30.0
-    rate = output.stdout.strip()
-    try:
-        if "/" in rate:
-            numerator, denominator = rate.split("/", 1)
-            fps = float(numerator) / float(denominator)
-        else:
-            fps = float(rate)
-    except (ValueError, ZeroDivisionError):
-        return 30.0
-    return fps if 1.0 < fps < 1000.0 else 30.0
+    output = subprocess.run(command, capture_output=True, check=True, text=True)
+    probe = json.loads(output.stdout)
+    start = float(probe.get("format", {}).get("start_time", 0.0))
+    times = [float(frame["best_effort_timestamp_time"]) - start for frame in probe["frames"]]
+    if not times or not all(math.isfinite(time) for time in times):
+        raise ValueError(f"{video}: video frames have no usable timestamps")
+    return times
 
 
 def iter_video_jpegs(
@@ -395,6 +383,8 @@ def iter_video_jpegs(
         str(video),
         "-an",
         "-sn",
+        "-fps_mode",
+        "passthrough",
         "-c:v",
         "mjpeg",
         "-q:v",
@@ -437,13 +427,23 @@ def iter_video_jpegs(
                 frame = bytes(buffer[start:following])
                 del buffer[:following]
                 if not frame.rstrip(b"\x00").endswith(b"\xff\xd9"):
-                    continue
+                    raise ValueError(f"{video}: incomplete JPEG frame {index}")
                 yield index, frame
                 index += 1
+        if limit is None or index < limit:
+            status = process.wait()
+            if status:
+                raise subprocess.CalledProcessError(status, command)
+            frame = bytes(buffer).rstrip(b"\x00")
+            if frame.startswith(soi) and frame.endswith(b"\xff\xd9"):
+                yield index, frame
+            elif frame:
+                raise ValueError(f"{video}: incomplete final JPEG frame")
     finally:
         if process.stdout is not None:
             process.stdout.close()
-        process.kill()
+        if process.poll() is None:
+            process.kill()
         process.wait()
 
 
@@ -520,45 +520,43 @@ def log_video(
     logging every frame gives the recording the video's own frame rate, so the
     camera's picture and its plots run together the way the footage did.
 
-    Each image goes to whichever station's solved frames are nearest in time, so
-    a file that holds two cameras keeps each one's pictures on its own entity.
+    Images are assigned to an already-observed station by the nearest solved
+    frame. Before the first solve they are kept as unposed footage, rather than
+    projecting them from an origin or pretending a future pose was measured.
     """
     if camera.video is None or not clusters:
         return
-    fps = video_fps(camera.video)
-    spans = [
-        (
-            min(float(frame["time"]) for frame in cluster),
-            max(float(frame["time"]) for frame in cluster),
+    times = video_times(camera.video)
+
+    def station_for(time: float) -> int | None:
+        available = [
+            index for index, cluster in enumerate(clusters)
+            if min(float(frame["time"]) for frame in cluster) <= time
+        ]
+        if not available:
+            return None
+        return min(
+            available,
+            key=lambda index: min(abs(time - float(frame["time"])) for frame in clusters[index]),
         )
-        for cluster in clusters
-    ]
-
-    def station_for(time: float) -> int:
-        def distance(span: tuple[float, float]) -> float:
-            low, high = span
-            if low <= time <= high:
-                return 0.0
-            return min(abs(time - low), abs(time - high))
-
-        return min(range(len(spans)), key=lambda index: distance(spans[index]))
 
     logged = 0
     for index, jpeg in iter_video_jpegs(camera.video, max_frames):
-        time = index / fps
+        if index >= len(times):
+            raise ValueError(f"{camera.video}: more decoded frames than timestamps")
+        time = times[index]
         rr.set_time("video_time", duration=time)
-        rr.set_time("frame", sequence=index)
-        rr.log(
-            f"{entities[station_for(time)]}/image",
-            rr.EncodedImage(contents=jpeg, media_type="image/jpeg"),
-        )
+        rr.set_time("frame", sequence=int(time * 1000))
+        station = station_for(time)
+        path = f"{entities[station]}/image" if station is not None else f"unposed/{camera.name}/image"
+        rr.log(path, rr.EncodedImage(contents=jpeg, media_type="image/jpeg"))
         logged += 1
         if logged % 600 == 0:
             print(f"  {camera.name}: {logged} frame(s)…", file=sys.stderr)
-    print(
-        f"  {camera.name}: logged {logged} frame(s) of video at {fps:.0f}fps",
-        file=sys.stderr,
-    )
+    expected = len(times) if max_frames is None else min(len(times), max(0, max_frames))
+    if logged != expected:
+        raise ValueError(f"{camera.video}: decoded {logged} frames, expected {expected}")
+    print(f"  {camera.name}: logged {logged} frame(s) of video", file=sys.stderr)
 
 
 def log_station(camera: Camera) -> None:
@@ -651,7 +649,7 @@ def log_pose(
         for index in range(len(clusters))
     ]
     for entity, cluster in zip(entities, clusters):
-        log_camera_static(entity, camera)
+        log_camera_pinhole(entity, camera, min(float(frame["time"]) for frame in cluster))
         log_frames(camera, cluster, entity)
 
     if with_video:

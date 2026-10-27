@@ -122,7 +122,7 @@ struct Judge<'a> {
     layout: &'a TagLayout,
     camera: &'a Intrinsics,
     pane: Pane,
-    support: &'a HashMap<u16, f64>,
+    support: &'a HashMap<u16, trust::IdSupport>,
     options: &'a PoseOptions,
     /// Whether `camera` came from a measurement rather than the `--fov` guess.
     calibrated: bool,
@@ -203,7 +203,7 @@ impl Judge<'_> {
             let weakest_support = solution
                 .tags
                 .iter()
-                .map(|id| self.support.get(id).copied().unwrap_or(0.0))
+                .map(|id| self.support.get(id).map_or(0.0, |support| support.fraction))
                 .fold(f64::INFINITY, f64::min);
             let confidence = trust::confidence(
                 &trust::Evidence {
@@ -292,8 +292,26 @@ pub fn estimate(video: &Path, options: &PoseOptions) -> Result<PoseReport> {
     if !options.tag_size_m.is_finite() || options.tag_size_m <= 0.0 {
         bail!("tag size must be positive, got {}", options.tag_size_m);
     }
-    if !(options.samples > 0) {
+    if options.samples == 0 {
         bail!("sample at least one frame, got {}", options.samples);
+    }
+    if !options.min_confidence.is_finite() || !(0.0..=1.0).contains(&options.min_confidence) {
+        bail!(
+            "minimum confidence must be between 0 and 1, got {}",
+            options.min_confidence
+        );
+    }
+    if !options.max_rms_px.is_finite() || options.max_rms_px <= 0.0 {
+        bail!(
+            "maximum reprojection error must be positive, got {}",
+            options.max_rms_px
+        );
+    }
+    if !options.min_margin.is_finite() || options.min_margin < 0.0 {
+        bail!(
+            "minimum margin must be non-negative, got {}",
+            options.min_margin
+        );
     }
     if !video.is_file() {
         bail!("no such video: {}", video.display());
@@ -406,23 +424,28 @@ pub fn estimate(video: &Path, options: &PoseOptions) -> Result<PoseReport> {
         provisional
     };
 
-    let station =
-        station::fit(&evaluated.views, &calibration.intrinsics).map(|fitted| StationReport {
-            position: [
-                fitted.pose.position.x,
-                fitted.pose.position.y,
-                fitted.pose.position.z,
-            ],
-            rotation: [
-                fitted.pose.rotation.w,
-                fitted.pose.rotation.x,
-                fitted.pose.rotation.y,
-                fitted.pose.rotation.z,
-            ],
-            rms_px: fitted.rms_px,
-            frames_used: fitted.frames_used,
-            frames_rejected: fitted.frames_rejected,
-        });
+    let station = station::fit(
+        &evaluated.views,
+        &calibration.intrinsics,
+        &layout,
+        options.max_rms_px,
+    )
+    .map(|fitted| StationReport {
+        position: [
+            fitted.pose.position.x,
+            fitted.pose.position.y,
+            fitted.pose.position.z,
+        ],
+        rotation: [
+            fitted.pose.rotation.w,
+            fitted.pose.rotation.x,
+            fitted.pose.rotation.y,
+            fitted.pose.rotation.z,
+        ],
+        rms_px: fitted.rms_px,
+        frames_used: fitted.frames_used,
+        frames_rejected: fitted.frames_rejected,
+    });
 
     Ok(PoseReport {
         video: video.to_path_buf(),
@@ -507,6 +530,30 @@ mod tests {
         let error = estimate(Path::new("no-such-video.mp4"), &PoseOptions::default())
             .expect_err("must fail");
         assert!(error.to_string().contains("no such video"), "got: {error}");
+    }
+
+    #[test]
+    fn invalid_confidence_and_error_limits_are_rejected() {
+        for minimum in [-0.1, 1.1, f64::NAN] {
+            let options = PoseOptions {
+                min_confidence: minimum,
+                ..PoseOptions::default()
+            };
+            assert!(estimate(Path::new("unused"), &options)
+                .unwrap_err()
+                .to_string()
+                .contains("confidence"));
+        }
+        for maximum in [0.0, -1.0, f64::NAN] {
+            let options = PoseOptions {
+                max_rms_px: maximum,
+                ..PoseOptions::default()
+            };
+            assert!(estimate(Path::new("unused"), &options)
+                .unwrap_err()
+                .to_string()
+                .contains("reprojection"));
+        }
     }
 
     #[test]

@@ -77,14 +77,18 @@ pub fn margin_floor(pixel_width: f64, base: f32) -> f32 {
     base * share
 }
 
-/// Which share of the frames that detected anything read each tag id.
-///
-/// A broadcast shows one camera for the whole segment, so a tag that stands in
-/// view is seen in every sampled frame where it is not occluded. An id the
-/// decoder produced once, and never again, is either moving through the picture
-/// or a mis-read; the count here does not decide on its own, but it is what
-/// [`keep`] checks the marginal reads against.
-pub fn id_support(frames: &[Vec<TagObservation>]) -> HashMap<u16, f64> {
+/// Independent frame count and relative frequency behind an id's support.
+#[derive(Debug, Clone, Copy)]
+pub struct IdSupport {
+    /// Fraction of informative frames in which the id was detected.
+    pub fraction: f64,
+    /// Number of distinct sampled frames in which the id was detected.
+    pub frames: usize,
+}
+
+/// Count the informative frames that read each id, and their share of the total.
+/// Marginal detections need another frame, not just a high fraction of one.
+pub fn id_support(frames: &[Vec<TagObservation>]) -> HashMap<u16, IdSupport> {
     let mut seen: HashMap<u16, usize> = HashMap::new();
     let mut informative = 0usize;
     for detections in frames {
@@ -103,7 +107,15 @@ pub fn id_support(frames: &[Vec<TagObservation>]) -> HashMap<u16, f64> {
         return HashMap::new();
     }
     seen.into_iter()
-        .map(|(id, count)| (id, count as f64 / informative as f64))
+        .map(|(id, count)| {
+            (
+                id,
+                IdSupport {
+                    fraction: count as f64 / informative as f64,
+                    frames: count,
+                },
+            )
+        })
         .collect()
 }
 
@@ -112,7 +124,7 @@ pub fn id_support(frames: &[Vec<TagObservation>]) -> HashMap<u16, f64> {
 /// Two ways in: it cleared the margin its own size deserves, or it is a small
 /// tag read marginally *and* another frame read the same id. A small tag seen
 /// in one frame at a low margin on its own is not evidence, it is a guess.
-pub fn keep(detection: &TagObservation, support: &HashMap<u16, f64>, base: f32) -> bool {
+pub fn keep(detection: &TagObservation, support: &HashMap<u16, IdSupport>, base: f32) -> bool {
     let width = detection.pixel_width();
     let floor = margin_floor(width, base);
     if detection.margin < floor {
@@ -121,7 +133,9 @@ pub fn keep(detection: &TagObservation, support: &HashMap<u16, f64>, base: f32) 
     if detection.margin >= base {
         return true;
     }
-    support.get(&detection.id).copied().unwrap_or(0.0) >= CORROBORATION
+    support
+        .get(&detection.id)
+        .is_some_and(|evidence| evidence.frames >= 2 && evidence.fraction >= CORROBORATION)
 }
 
 /// Why a pose cannot be a camera filming a field, or `Ok` if it can.
@@ -264,11 +278,34 @@ mod tests {
         // deserves, so the counting is what decides.
         let lone = observation(13, 16.0, 20.0);
         let mut support = HashMap::new();
-        support.insert(13u16, 0.1);
+        support.insert(
+            13u16,
+            IdSupport {
+                fraction: 0.1,
+                frames: 1,
+            },
+        );
         assert!(!keep(&lone, &support, base));
 
         // The same read, with the id turning up in other frames: in.
-        support.insert(13, 0.8);
+        support.insert(
+            13,
+            IdSupport {
+                fraction: 1.0,
+                frames: 1,
+            },
+        );
+        assert!(
+            !keep(&lone, &support, base),
+            "one informative frame cannot corroborate itself"
+        );
+        support.insert(
+            13,
+            IdSupport {
+                fraction: 0.8,
+                frames: 2,
+            },
+        );
         assert!(keep(&lone, &support, base));
 
         // Small but clear: no corroboration needed, the margin speaks for it.
@@ -289,9 +326,11 @@ mod tests {
             vec![observation(13, 40.0, 90.0), observation(99, 10.0, 12.0)],
         ];
         let support = id_support(&frames);
-        assert_eq!(support.get(&13), Some(&1.0));
-        assert!((support.get(&14).copied().unwrap_or(0.0) - 1.0 / 3.0).abs() < 1e-9);
-        assert!((support.get(&99).copied().unwrap_or(0.0) - 1.0 / 3.0).abs() < 1e-9);
+        assert_eq!(support[&13].fraction, 1.0);
+        assert_eq!(support[&13].frames, 3);
+        assert!((support[&14].fraction - 1.0 / 3.0).abs() < 1e-9);
+        assert!((support[&99].fraction - 1.0 / 3.0).abs() < 1e-9);
+        assert_eq!(support[&99].frames, 1);
         // The frame with nothing in it is not a vote that its tags are missing.
         assert!(id_support(&[]).is_empty());
     }

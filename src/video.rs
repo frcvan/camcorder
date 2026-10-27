@@ -18,6 +18,7 @@ use std::{
     io::Write as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -1060,7 +1061,7 @@ pub fn split_views(input: &Path, dest: &Path, options: &SplitOptions) -> Result<
 
         for (index, pane) in segment_report.layout.panes.iter().enumerate() {
             let out = dest.join(format!("seg{:02}_view{}.mp4", segment.index + 1, index + 1));
-            if out.is_file() && !options.force {
+            if out.is_file() && !options.force && probe(&out).is_ok() {
                 report.skipped.push(out);
                 segment_report.skipped += 1;
                 continue;
@@ -1091,6 +1092,7 @@ fn cut_pane(
     pane: &Pane,
     options: &SplitOptions,
 ) -> Result<()> {
+    let temporary = TemporaryOutput::new(out)?;
     let mut cmd = Command::new(BIN_FFMPEG);
     cmd.args([
         "-hide_banner",
@@ -1126,7 +1128,7 @@ fn cut_pane(
         "-movflags",
         "+faststart",
     ])
-    .arg(out);
+    .arg(&temporary.path);
 
     run_capture(
         &mut cmd,
@@ -1136,7 +1138,7 @@ fn cut_pane(
             out.display()
         ),
     )?;
-    Ok(())
+    temporary.publish(&temporary.path, out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,6 +1150,7 @@ pub fn download_youtube(video_key: &str, dest: &Path) -> Result<PathBuf> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
+    let temporary = TemporaryOutput::new(dest)?;
     let url = format!("https://www.youtube.com/watch?v={video_key}");
     let mut cmd = Command::new(BIN_YTDLP);
     cmd.args([
@@ -1159,11 +1162,15 @@ pub fn download_youtube(video_key: &str, dest: &Path) -> Result<PathBuf> {
         "mp4",
         "-o",
     ])
-    .arg(dest)
+    .arg(&temporary.path)
     .arg(&url);
     run_capture(&mut cmd, &format!("yt-dlp {url}"))?;
 
-    resolve_downloaded(dest).with_context(|| format!("yt-dlp did not produce {}", dest.display()))
+    let downloaded = resolve_downloaded(&temporary.path)
+        .with_context(|| format!("yt-dlp did not produce {}", dest.display()))?;
+    probe(&downloaded).context("checking downloaded video")?;
+    temporary.publish(&downloaded, dest)?;
+    Ok(dest.to_path_buf())
 }
 
 /// Download a file URL straight over HTTP.
@@ -1182,11 +1189,15 @@ pub fn download_direct(url: &str, dest: &Path) -> Result<PathBuf> {
     if !response.status().is_success() {
         bail!("downloading {url} failed: {}", response.status());
     }
-    let mut file =
-        fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
+    let temporary = TemporaryOutput::new(dest)?;
+    let mut file = fs::File::create(&temporary.path)
+        .with_context(|| format!("creating {}", temporary.path.display()))?;
     std::io::copy(&mut response, &mut file)
-        .with_context(|| format!("writing {}", dest.display()))?;
+        .with_context(|| format!("writing {}", temporary.path.display()))?;
     file.flush()?;
+    drop(file);
+    probe(&temporary.path).context("checking downloaded video")?;
+    temporary.publish(&temporary.path, dest)?;
     Ok(dest.to_path_buf())
 }
 
@@ -1217,6 +1228,53 @@ fn resolve_downloaded(dest: &Path) -> Result<PathBuf> {
 // process helpers
 // ---------------------------------------------------------------------------
 
+/// Write beside the destination and publish only after the producer succeeds.
+/// A private directory also keeps yt-dlp's intermediate files out of the cache.
+struct TemporaryOutput {
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl TemporaryOutput {
+    fn new(dest: &Path) -> Result<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let parent = dest
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let name = dest.file_name().context("output has no filename")?;
+        loop {
+            let dir = parent.join(format!(
+                ".camcorder-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            match fs::create_dir(&dir) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path: dir.join(name),
+                        dir,
+                    })
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| format!("creating {}", dir.display()))
+                }
+            }
+        }
+    }
+
+    fn publish(&self, source: &Path, dest: &Path) -> Result<()> {
+        fs::rename(source, dest).with_context(|| format!("publishing {}", dest.display()))
+    }
+}
+
+impl Drop for TemporaryOutput {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
 fn run_capture(cmd: &mut Command, what: &str) -> Result<std::process::Output> {
     let output = cmd
         .stdin(Stdio::null())
@@ -1234,6 +1292,32 @@ fn run_capture(cmd: &mut Command, what: &str) -> Result<std::process::Output> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_interrupted_download_does_not_replace_the_cached_video() {
+        use std::io::Read as _;
+        use std::net::TcpListener;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let dest = dir.path().join("video.mp4");
+        fs::write(&dest, b"existing video").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort",
+                )
+                .unwrap();
+        });
+        assert!(download_direct(&format!("http://{address}/video"), &dest).is_err());
+        server.join().unwrap();
+        assert_eq!(fs::read(&dest).unwrap(), b"existing video");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn grid_parses_and_divides_frames() {

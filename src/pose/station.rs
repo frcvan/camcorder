@@ -20,7 +20,9 @@
 //! camera that really did pan should still be visible as having panned.
 
 use super::{
+    layout::TagLayout,
     solve::{self, Correspondence},
+    trust,
     types::{CameraPose, Intrinsics},
 };
 
@@ -39,11 +41,17 @@ const CALIBRATION_GAIN: f64 = 0.75;
 /// allowed range, halved every distance in the video, and put the camera at
 /// knee height inside the field. Two frames that have to agree cannot do that.
 const MIN_CALIBRATION_FRAMES: usize = 2;
+/// Measurements farther apart than 20% do not describe the same lens.
+const MAX_FOCAL_DISAGREEMENT: f64 = 1.2;
 /// A frame is dropped from the station pose when it reprojects worse than this
 /// many times the median frame, or worse than the absolute floor. A pan shows
 /// up as exactly this: most frames agree, a few are elsewhere.
 const FRAME_OUTLIER_FACTOR: f64 = 2.5;
 const FRAME_OUTLIER_PX: f64 = 4.0;
+/// Similar-looking isolated tags can reproject under cameras metres apart.
+/// A station needs agreement in 3D as well as in the image.
+const STATION_POSITION_TOLERANCE_M: f64 = 3.0;
+const STATION_ROTATION_TOLERANCE_DEG: f64 = 25.0;
 const MOST_ROUNDS: usize = 3;
 
 /// One frame's contribution to the cross-frame fits.
@@ -126,25 +134,40 @@ pub(crate) fn calibrate(views: &[View], assumed: Intrinsics) -> Calibration {
         };
         ratios.push(measured);
     }
-    if ratios.len() < MIN_CALIBRATION_FRAMES {
-        // Below the floor the frames that did measure are kept out of the
-        // report's count: nothing was adopted, so nothing was measured.
+    let Some((ratio, frames)) = agreeing_focal_ratio(&mut ratios) else {
         return Calibration {
             intrinsics: assumed,
             measured: false,
             frames: 0,
             ratio: 1.0,
         };
-    }
-    ratios.sort_by(f64::total_cmp);
-    let ratio = ratios[ratios.len() / 2];
-    let intrinsics = with_focal(&assumed, ratio);
+    };
     Calibration {
-        intrinsics,
+        intrinsics: with_focal(&assumed, ratio),
         measured: true,
-        frames: ratios.len(),
+        frames,
         ratio,
     }
+}
+
+/// A majority of independent measurements must agree before setting the lens.
+fn agreeing_focal_ratio(ratios: &mut [f64]) -> Option<(f64, usize)> {
+    ratios.sort_by(f64::total_cmp);
+    let mut best = (0, 0);
+    let mut end = 0;
+    for start in 0..ratios.len() {
+        while end < ratios.len() && ratios[end] <= ratios[start] * MAX_FOCAL_DISAGREEMENT {
+            end += 1;
+        }
+        if end - start > best.1 - best.0 {
+            best = (start, end);
+        }
+    }
+    let count = best.1 - best.0;
+    if count < MIN_CALIBRATION_FRAMES || count * 2 <= ratios.len() {
+        return None;
+    }
+    Some((ratios[best.0 + count / 2], count))
 }
 
 /// The focal-length multiple that best explains one frame's corners.
@@ -238,7 +261,21 @@ pub(crate) struct Station {
 /// corners: the thing that separates one broadcast camera's samples from each
 /// other is motion of the whole frame, not a bad corner here and there, and a
 /// corner rejected across frames would move the station pose for no reason.
-pub(crate) fn fit(views: &[View], camera: &Intrinsics) -> Option<Station> {
+fn same_station(a: &CameraPose, b: &CameraPose) -> bool {
+    let a = a.rotation;
+    let b = b.rotation;
+    let dot = (a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z)
+        .abs()
+        .clamp(0.0, 1.0);
+    2.0 * dot.acos().to_degrees() <= STATION_ROTATION_TOLERANCE_DEG
+}
+
+pub(crate) fn fit(
+    views: &[View],
+    camera: &Intrinsics,
+    layout: &TagLayout,
+    max_rms_px: f64,
+) -> Option<Station> {
     let usable: Vec<&View> = views
         .iter()
         .filter(|view| view.corners.len() >= 4)
@@ -246,20 +283,34 @@ pub(crate) fn fit(views: &[View], camera: &Intrinsics) -> Option<Station> {
     if usable.is_empty() {
         return None;
     }
-    // Start from the frame that fits best on its own: it is the one most likely
-    // to be the camera's real position, and it puts the bundle fit in the right
-    // basin.
-    let start = usable
+    // Seed from the pose explaining the most frames before any joint fit. A
+    // least-squares compromise over different cameras inflates the median error
+    // and can make every frame look like an inlier.
+    let (mut start, mut keep) = usable
         .iter()
-        .filter_map(|view| {
-            solve::refine(view.pose, &view.corners, camera)
-                .map(|solution| (solution.rms_px, view.pose))
+        .map(|seed| {
+            let inliers: Vec<usize> = usable
+                .iter()
+                .enumerate()
+                .filter(|(_, view)| {
+                    (seed.pose.position - view.pose.position).norm() <= STATION_POSITION_TOLERANCE_M
+                        && same_station(&seed.pose, &view.pose)
+                        && solve::reprojection_rms(&seed.pose, &view.corners, camera)
+                            <= FRAME_OUTLIER_PX
+                })
+                .map(|(index, _)| index)
+                .collect();
+            let error: f64 = inliers
+                .iter()
+                .map(|index| solve::reprojection_rms(&seed.pose, &usable[*index].corners, camera))
+                .sum();
+            (seed.pose, inliers, error)
         })
-        .min_by(|a, b| a.0.total_cmp(&b.0))
-        .map(|(_, pose)| pose)
-        .or(Some(usable[0].pose))?;
-
-    let mut keep: Vec<usize> = (0..usable.len()).collect();
+        .max_by(|a, b| a.1.len().cmp(&b.1.len()).then_with(|| b.2.total_cmp(&a.2)))
+        .map(|(pose, inliers, _)| (pose, inliers))?;
+    if keep.is_empty() || keep.len() * 2 <= usable.len() {
+        return None;
+    }
     let mut solution = None;
     for _ in 0..MOST_ROUNDS {
         let corners: Vec<Correspondence> = keep
@@ -267,6 +318,7 @@ pub(crate) fn fit(views: &[View], camera: &Intrinsics) -> Option<Station> {
             .flat_map(|index| usable[*index].corners.iter().copied())
             .collect();
         let fitted = solve::refine(start, &corners, camera)?;
+        start = fitted.pose;
         solution = Some(fitted.clone());
         if keep.len() == 1 {
             break;
@@ -286,13 +338,34 @@ pub(crate) fn fit(views: &[View], camera: &Intrinsics) -> Option<Station> {
             .filter(|(_, error)| **error <= limit)
             .map(|(index, _)| *index)
             .collect();
-        if kept.len() == keep.len() || kept.is_empty() {
+        if kept.len() == keep.len() {
             break;
         }
+        if kept.is_empty() || kept.len() * 2 <= usable.len() {
+            return None;
+        }
         keep = kept;
+        // The last rejection still needs a fit to the retained frames.
+        solution = None;
     }
 
-    let solution = solution?;
+    let solution = match solution {
+        Some(solution) => solution,
+        None => {
+            let corners: Vec<Correspondence> = keep
+                .iter()
+                .flat_map(|index| usable[*index].corners.iter().copied())
+                .collect();
+            solve::refine(start, &corners, camera)?
+        }
+    };
+    if solution.rms_px > max_rms_px
+        || keep
+            .iter()
+            .any(|index| trust::plausible(&solution.pose, layout, &usable[*index].tags).is_err())
+    {
+        return None;
+    }
     Some(Station {
         pose: solution.pose,
         rms_px: solution.rms_px,
@@ -408,6 +481,44 @@ mod tests {
             "the assumed lens should have been visibly wrong, was {:.2}m out",
             (before.pose.position - pose.position).norm()
         );
+    }
+
+    #[test]
+    fn disagreeing_frames_cannot_set_the_lens() {
+        let layout = test_layout(&[
+            facing_tag(3, Vec3::new(6.0, 6.0, 0.5)),
+            facing_tag(4, Vec3::new(9.0, 6.0, 0.5)),
+        ]);
+        let pose = look_at(Vec3::new(2.0, 1.0, 4.0), Vec3::new(7.5, 6.0, 0.5));
+        let assumed = Intrinsics::from_horizontal_fov(1920, 1080, 75.0);
+        let views: Vec<View> = [50.0, 65.0]
+            .into_iter()
+            .map(|fov| View {
+                corners: corners_of(
+                    &layout,
+                    &[3, 4],
+                    0.1651,
+                    pose,
+                    &Intrinsics::from_horizontal_fov(1920, 1080, fov),
+                ),
+                pose,
+                tags: vec![3, 4],
+            })
+            .collect();
+        for view in &views {
+            assert!(
+                focal_ratio(view, &assumed).is_some(),
+                "each frame must independently measure"
+            );
+        }
+        let calibration = calibrate(&views, assumed);
+        assert!(
+            !calibration.measured,
+            "conflicting measurements must not set the lens"
+        );
+        assert_eq!(calibration.intrinsics, assumed);
+        assert_eq!(agreeing_focal_ratio(&mut [0.8, 1.4, 1.42]), Some((1.42, 2)));
+        assert_eq!(agreeing_focal_ratio(&mut [0.8, 0.81, 1.4, 1.42]), None);
     }
 
     #[test]
@@ -533,12 +644,58 @@ mod tests {
             tags: vec![3, 4],
         });
 
-        let station = fit(&views, &camera).expect("a station");
+        let station = fit(&views, &camera, &layout, 8.0).expect("a station");
         assert_eq!(station.frames_used, 4, "the stray frame should be dropped");
         assert_eq!(station.frames_rejected, 1);
         let error = (station.pose.position - truth.position).norm();
         assert!(error < 0.1, "station pose {error:.2}m from the truth");
         assert!(station.rms_px < 1.0, "station rms {:.2}px", station.rms_px);
+    }
+
+    #[test]
+    fn a_station_rejects_a_second_camera_before_fitting() {
+        // Competing cameras must not pull the initial least-squares fit between
+        // them: doing that inflates the median residual and retains both groups.
+        let layout = test_layout(&[
+            facing_tag(3, Vec3::new(6.0, 6.0, 0.5)),
+            facing_tag(4, Vec3::new(9.0, 6.0, 0.5)),
+        ]);
+        let camera = Intrinsics::from_horizontal_fov(1280, 720, 60.0);
+        let first = look_at(Vec3::new(2.0, 1.0, 4.0), Vec3::new(7.5, 6.0, 0.5));
+        let second = look_at(Vec3::new(10.0, -3.0, 6.0), Vec3::new(7.5, 6.0, 0.5));
+        let views: Vec<View> = [first, first, first, second, second]
+            .into_iter()
+            .map(|pose| View {
+                corners: corners_of(&layout, &[3, 4], 0.1651, pose, &camera),
+                pose,
+                tags: vec![3, 4],
+            })
+            .collect();
+        let station = fit(&views, &camera, &layout, 8.0).expect("majority camera");
+        assert_eq!(station.frames_used, 3);
+        assert_eq!(station.frames_rejected, 2);
+        assert!((station.pose.position - first.position).norm() < 0.05);
+        assert!(station.rms_px < 1.0);
+    }
+
+    #[test]
+    fn a_single_tag_fit_does_not_hide_far_away_solutions() {
+        let layout = test_layout(&[facing_tag(3, Vec3::new(6.0, 6.0, 0.5))]);
+        let camera = Intrinsics::from_horizontal_fov(1280, 720, 60.0);
+        let first = look_at(Vec3::new(2.0, 1.0, 4.0), Vec3::new(6.0, 6.0, 0.5));
+        let distant = look_at(Vec3::new(10.0, 1.0, 4.0), Vec3::new(6.0, 6.0, 0.5));
+        let corners = corners_of(&layout, &[3], 0.1651, first, &camera);
+        let views: Vec<View> = [first, first, first, distant, distant]
+            .into_iter()
+            .map(|pose| View {
+                corners: corners.clone(),
+                pose,
+                tags: vec![3],
+            })
+            .collect();
+        let station = fit(&views, &camera, &layout, 8.0).expect("majority camera");
+        assert_eq!(station.frames_used, 3);
+        assert_eq!(station.frames_rejected, 2);
     }
 
     #[test]
@@ -552,9 +709,9 @@ mod tests {
             pose,
             tags: vec![13],
         }];
-        let station = fit(&views, &camera).expect("a station");
+        let station = fit(&views, &camera, &layout, 8.0).expect("a station");
         assert_eq!(station.frames_used, 1);
         assert_eq!(station.frames_rejected, 0);
-        assert!(fit(&[], &camera).is_none());
+        assert!(fit(&[], &camera, &layout, 8.0).is_none());
     }
 }

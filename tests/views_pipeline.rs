@@ -611,6 +611,35 @@ fn scenes_only_mode_never_crops() {
 }
 
 #[test]
+fn failed_and_incomplete_splits_are_not_cached() {
+    let temp = Temp::new();
+    let input = temp.path("side-by-side.mp4");
+    build_side_by_side_video(&input);
+    let dest = temp.path("views");
+    let mut opts = options(SplitMode::Tiled, Layout::Grid(Grid::SINGLE));
+    let report = video::split_views(&input, &dest, &opts).expect("first split");
+    let output = &report.outputs[0];
+    let original = std::fs::read(output).expect("original output");
+
+    opts.preset = "not-an-x264-preset".into();
+    assert!(video::split_views(&input, &dest, &opts).is_err());
+    assert_eq!(
+        std::fs::read(output).unwrap(),
+        original,
+        "failed force must preserve the old file"
+    );
+
+    std::fs::write(output, b"interrupted output").unwrap();
+    opts.force = false;
+    opts.preset = "ultrafast".into();
+    let report = video::split_views(&input, &dest, &opts).expect("retry split");
+    assert_eq!(report.outputs.len(), 1);
+    assert!(report.skipped.is_empty());
+    video::probe(output).expect("retry produced a video");
+    assert_eq!(sorted_file_names(&dest), vec!["seg01_view1.mp4"]);
+}
+
+#[test]
 fn cli_splits_a_video_file() {
     let temp = Temp::new();
     let input = temp.path("championship.mp4");

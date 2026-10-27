@@ -80,10 +80,9 @@ pub fn grab(video: &Path, info: &VideoInfo, times: &[f64]) -> Result<Vec<Frame>>
     for &time in times {
         match grab_one(video, time, info.width, info.height) {
             Ok(frame) => frames.push(frame),
-            Err(error) if !frames.is_empty() => {
+            Err(error) => {
                 eprintln!("  note: could not sample {time:.2}s ({error:#})");
             }
-            Err(error) => return Err(error),
         }
     }
     if frames.is_empty() {
@@ -170,6 +169,33 @@ mod tests {
     fn the_greyscale_plane_is_the_luma_of_the_colour_one() {
         let grey = to_grey(&[255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255]);
         assert_eq!(grey, vec![255, 0, 76, 149, 28]);
+    }
+
+    #[test]
+    fn an_invalid_first_sample_does_not_hide_later_frames() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let video = dir.path().join("clip.mp4");
+        let output = Command::new(BIN_FFMPEG)
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=64x64:rate=5:duration=1",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&video)
+            .output()
+            .expect("ffmpeg");
+        assert!(output.status.success());
+        let info = crate::video::probe(&video).expect("probe");
+        let frames = grab(&video, &info, &[2.0, 0.4]).expect("later sample survives");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].time, 0.4);
+        assert!(grab(&video, &info, &[2.0]).is_err());
     }
 
     #[test]

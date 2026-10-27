@@ -134,7 +134,7 @@ pub fn download_match_videos(
             continue;
         };
         let dest = paths.video_file(config.team, &m.key);
-        if dest.is_file() && !force {
+        if dest.is_file() && !force && video::probe(&dest).is_ok() {
             outcome.ok.push(Download {
                 match_key: m.key.clone(),
                 path: dest,
