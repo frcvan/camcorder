@@ -111,7 +111,8 @@ impl Grid {
         let (tile_width, tile_height) = self.tile_dims(width, height);
         let col = index % self.cols;
         let row = index / self.cols;
-        let x = (col * tile_width + width.saturating_sub(self.cols * tile_width) / 2).min(width - 1);
+        let x =
+            (col * tile_width + width.saturating_sub(self.cols * tile_width) / 2).min(width - 1);
         let y = (row * tile_height + height.saturating_sub(self.rows * tile_height) / 2)
             .min(height - 1);
         (tile_width, tile_height, x, y)
@@ -152,10 +153,7 @@ impl Pane {
     }
 
     pub fn crop_filter(&self) -> String {
-        format!(
-            "crop={}:{}:{}:{}",
-            self.width, self.height, self.x, self.y
-        )
+        format!("crop={}:{}:{}:{}", self.width, self.height, self.x, self.y)
     }
 
     /// x264 needs even sizes, and cropping on an even boundary avoids extra chroma work.
@@ -310,7 +308,9 @@ pub fn scene_cuts(path: &Path, threshold: f32) -> Result<Vec<f64>> {
         .args(["-filter:v", &filter, "-an", "-sn", "-f", "null", "-"])
         .stdout(Stdio::null());
     let output = run_capture(&mut cmd, "ffmpeg scene detection")?;
-    Ok(parse_showinfo_times(&String::from_utf8_lossy(&output.stderr)))
+    Ok(parse_showinfo_times(&String::from_utf8_lossy(
+        &output.stderr,
+    )))
 }
 
 /// Pull `pts_time:` values out of ffmpeg's `showinfo` log lines.
@@ -584,15 +584,14 @@ fn find_divider(
     let above = baseline(profile, best.0, far, true);
     let below = baseline(profile, best.0, far, false);
     let luma = beyond(profile.luma[best.0], above.0, below.0);
-    let chroma = beyond(profile.u[best.0], above.1, below.1)
-        + beyond(profile.v[best.0], above.2, below.2);
+    let chroma =
+        beyond(profile.u[best.0], above.1, below.1) + beyond(profile.v[best.0], above.2, below.2);
     let by_colour = chroma > luma;
     let peak = if by_colour { chroma } else { luma };
     let floor = peak * 0.4;
     let measure = |index: usize| {
         if by_colour {
-            beyond(profile.u[index], above.1, below.1)
-                + beyond(profile.v[index], above.2, below.2)
+            beyond(profile.u[index], above.1, below.1) + beyond(profile.v[index], above.2, below.2)
         } else {
             beyond(profile.luma[index], above.0, below.0)
         }
@@ -862,7 +861,6 @@ fn column_profile(analysis: &Analysis, y0: usize, y1: usize) -> Profile {
     Profile { luma, u, v }
 }
 
-
 fn sample_frames(path: &Path, info: &VideoInfo, window: (f64, f64)) -> Result<Vec<YuvFrame>> {
     let times = sample_times(window, info.duration, SEAM_SAMPLE_FRAMES);
     let mut frames = Vec::new();
@@ -996,12 +994,17 @@ pub struct SplitReport {
 
 impl SplitReport {
     pub fn views(&self) -> usize {
-        self.segments.iter().map(|report| report.layout.views()).sum()
+        self.segments
+            .iter()
+            .map(|report| report.layout.views())
+            .sum()
     }
 
     /// True when every segment came out as one plain full-frame view.
     pub fn is_single_view_throughout(&self) -> bool {
-        self.segments.iter().all(|report| report.layout.views() == 1)
+        self.segments
+            .iter()
+            .all(|report| report.layout.views() == 1)
     }
 }
 
@@ -1056,11 +1059,7 @@ pub fn split_views(input: &Path, dest: &Path, options: &SplitOptions) -> Result<
         };
 
         for (index, pane) in segment_report.layout.panes.iter().enumerate() {
-            let out = dest.join(format!(
-                "seg{:02}_view{}.mp4",
-                segment.index + 1,
-                index + 1
-            ));
+            let out = dest.join(format!("seg{:02}_view{}.mp4", segment.index + 1, index + 1));
             if out.is_file() && !options.force {
                 report.skipped.push(out);
                 segment_report.skipped += 1;
@@ -1131,7 +1130,11 @@ fn cut_pane(
 
     run_capture(
         &mut cmd,
-        &format!("ffmpeg splitting {} into {}", input.display(), out.display()),
+        &format!(
+            "ffmpeg splitting {} into {}",
+            input.display(),
+            out.display()
+        ),
     )?;
     Ok(())
 }
@@ -1172,12 +1175,17 @@ pub fn download_direct(url: &str, dest: &Path) -> Result<PathBuf> {
         .timeout(Duration::from_secs(1800))
         .build()
         .context("building the HTTP client")?;
-    let mut response = client.get(url).send().with_context(|| format!("GET {url}"))?;
+    let mut response = client
+        .get(url)
+        .send()
+        .with_context(|| format!("GET {url}"))?;
     if !response.status().is_success() {
         bail!("downloading {url} failed: {}", response.status());
     }
-    let mut file = fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
-    std::io::copy(&mut response, &mut file).with_context(|| format!("writing {}", dest.display()))?;
+    let mut file =
+        fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
+    std::io::copy(&mut response, &mut file)
+        .with_context(|| format!("writing {}", dest.display()))?;
     file.flush()?;
     Ok(dest.to_path_buf())
 }
@@ -1187,7 +1195,10 @@ fn resolve_downloaded(dest: &Path) -> Result<PathBuf> {
     if dest.is_file() {
         return Ok(dest.to_path_buf());
     }
-    let stem = dest.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+    let stem = dest
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
     if let Some(parent) = dest.parent() {
         for entry in fs::read_dir(parent)?.flatten() {
             let path = entry.path();
@@ -1287,9 +1298,21 @@ some other ffmpeg chatter pts_time:99";
         assert_eq!(
             segments,
             vec![
-                Segment { index: 0, start: 0.0, end: 10.0 },
-                Segment { index: 1, start: 10.0, end: 20.0 },
-                Segment { index: 2, start: 20.0, end: 30.0 },
+                Segment {
+                    index: 0,
+                    start: 0.0,
+                    end: 10.0
+                },
+                Segment {
+                    index: 1,
+                    start: 10.0,
+                    end: 20.0
+                },
+                Segment {
+                    index: 2,
+                    start: 20.0,
+                    end: 30.0
+                },
             ]
         );
     }
@@ -1297,7 +1320,14 @@ some other ffmpeg chatter pts_time:99";
     #[test]
     fn short_tail_is_merged_into_the_previous_segment() {
         let segments = build_segments(&[28.5], 30.0, 2.0);
-        assert_eq!(segments, vec![Segment { index: 0, start: 0.0, end: 30.0 }]);
+        assert_eq!(
+            segments,
+            vec![Segment {
+                index: 0,
+                start: 0.0,
+                end: 30.0
+            }]
+        );
     }
 
     #[test]

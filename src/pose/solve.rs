@@ -4,9 +4,21 @@
 //! One tag gives a planar homography, which is enough to start; two or more
 //! tags constrain the pose properly, so the refinement uses all of them at once
 //! and the result is the pose that best reprojects everything the camera saw.
+//!
+//! One tag is where this gets interesting. A single square has *two* poses that
+//! reproject its corners to the same pixels, and with real corner noise the
+//! wrong one often fits better than the right one. On the fixture that prompted
+//! [`restart_seeds`], 13 frames in 40 solved to a camera three metres under the
+//! carpet looking at the roof, at a reprojection error of 0.06px against the
+//! true pose's 0.39px. Reprojection error cannot separate them, so the answer is
+//! chosen the way a person would: by whether it is a camera that could have
+//! filmed the picture at all ([`trust::plausible`]), by which end of the field
+//! the colours around the tag say the camera is at, and only then by the fit.
 
 use super::{
     layout::TagLayout,
+    side::{end_of_x, End},
+    trust,
     types::{CameraPose, Intrinsics, Mat3, Quat, TagObservation, Vec3},
 };
 
@@ -23,23 +35,81 @@ pub struct Solution {
 }
 
 /// A 3D point on a tag and where it was seen.
-#[derive(Clone, Copy)]
-struct Correspondence {
-    field: Vec3,
-    image: (f64, f64),
-    tag: u16,
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Correspondence {
+    pub(crate) field: Vec3,
+    pub(crate) image: (f64, f64),
+    pub(crate) tag: u16,
 }
 
-/// Solve the camera pose from one frame's detections.
-///
-/// Returns `None` when nothing in the frame can be solved — no known tags, or
-/// too few corners.
+/// Solve the camera pose from one frame's detections, with no outside hint.
 pub fn solve(
     observations: &[TagObservation],
     layout: &TagLayout,
     tag_size: f64,
     camera: &Intrinsics,
 ) -> Option<Solution> {
+    solve_preferring(observations, layout, tag_size, camera, None).ok()
+}
+
+/// Solve the camera pose, preferring a particular end of the field.
+///
+/// `prefer` is what the colours around the tag say — red surroundings mean the
+/// red end — and is used only when two poses fit the corners about equally
+/// well. That is exactly the one-tag case, where the fit alone cannot choose.
+/// The error says why nothing usable came back, for the report to print.
+pub fn solve_preferring(
+    observations: &[TagObservation],
+    layout: &TagLayout,
+    tag_size: f64,
+    camera: &Intrinsics,
+    prefer: Option<End>,
+) -> Result<Solution, String> {
+    let corners = correspondences(observations, layout, tag_size);
+    if corners.len() < 4 {
+        return Err("no tag in the frame is in the layout".to_string());
+    }
+
+    let mut pool = candidate_poses(observations, &corners, layout, tag_size, camera);
+
+    // Restarting costs a few dozen small refinements, so it is only done when
+    // the homography's own answer cannot be believed: it is missing, it is not
+    // a camera that could have filmed the picture, or it is at the other end of
+    // the field from the one the colours name.
+    if pool.is_empty() || !settled(&pool, layout, prefer) {
+        // A frame with no candidate at all is one whose homography would not
+        // decompose — a handful of pixels of corner noise is enough. There is
+        // still a pose in the corners; the seeds find it without needing the
+        // decomposition to have worked.
+        let (origin, agreed) = match pool.iter().min_by(|a, b| a.0.rms_px.total_cmp(&b.0.rms_px)) {
+            Some((closest, agreed)) => (closest.pose.position, agreed.clone()),
+            None => {
+                let centre = centre_of(&corners);
+                (centre + Vec3::new(0.0, 0.0, 10.0), corners.clone())
+            }
+        };
+        let tags: Vec<u16> = {
+            let mut ids: Vec<u16> = agreed.iter().map(|corner| corner.tag).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
+        for seed in restart_seeds(&agreed, layout, &tags, origin) {
+            if let Some(solution) = refine(seed, &agreed, camera) {
+                pool.push((solution, agreed.clone()));
+            }
+        }
+    }
+
+    choose(pool, layout, prefer)
+}
+
+/// Every corner of every known tag in the frame, ready to fit.
+pub(crate) fn correspondences(
+    observations: &[TagObservation],
+    layout: &TagLayout,
+    tag_size: f64,
+) -> Vec<Correspondence> {
     let mut corners = Vec::new();
     for observation in observations {
         let Some(tag_corners) = layout.corners(observation.id, tag_size) else {
@@ -53,17 +123,32 @@ pub fn solve(
             });
         }
     }
-    if corners.len() < 4 {
-        return None;
-    }
+    corners
+}
 
-    // Every tag proposes a pose; the proposal that explains the most tags wins,
-    // and only the tags it explains are used for the final solve. A mis-read
-    // tag never gets a vote: it agrees with nothing, so no other tag's proposal
-    // includes it. Fitting everything first and rejecting afterwards does not
-    // work — one joint fit spreads the error over all the tags, so nothing ever
-    // looks like an outlier.
-    let mut best: Option<(Solution, usize, bool)> = None;
+/// The average of a set of corners, which for the tags of one frame is the
+/// middle of the patch of tags that were read.
+fn centre_of(corners: &[Correspondence]) -> Vec3 {
+    let mut centre = Vec3::new(0.0, 0.0, 0.0);
+    for corner in corners {
+        centre = centre + corner.field;
+    }
+    centre.scaled(1.0 / corners.len().max(1) as f64)
+}
+
+/// One pose per tag, each refined against the tags it agrees with.
+///
+/// The proposal that explains the most tags is not picked here; every proposal
+/// goes into the pool and [`choose`] ranks them, because the ranking needs to
+/// weigh the physical constraints that a single tag cannot express.
+fn candidate_poses(
+    observations: &[TagObservation],
+    corners: &[Correspondence],
+    layout: &TagLayout,
+    tag_size: f64,
+    camera: &Intrinsics,
+) -> Vec<(Solution, Vec<Correspondence>)> {
+    let mut pool = Vec::new();
     for observation in observations {
         let Some(tag) = layout.tag(observation.id) else {
             continue;
@@ -78,14 +163,14 @@ pub fn solve(
         // moves the tag itself by more than a tight tolerance allows — so the
         // first pass is deliberately loose, the refinement fixes the pose, and
         // the second pass decides which tags really belong.
-        let loose = agreed_corners(observations, &corners, candidate, camera, loose_tolerance);
+        let loose = agreed_corners(observations, corners, candidate, camera, loose_tolerance);
         if loose.len() < corners.len().min(4) {
             continue;
         }
         let Some(coarse) = refine(candidate, &loose, camera) else {
             continue;
         };
-        let tight = agreed_corners(observations, &corners, coarse.pose, camera, tight_tolerance);
+        let tight = agreed_corners(observations, corners, coarse.pose, camera, tight_tolerance);
         let (agreed, refined) = if tight.len() >= 4 && tight.len() < loose.len() {
             match refine(coarse.pose, &tight, camera) {
                 Some(solution) => (tight, solution),
@@ -94,22 +179,186 @@ pub fn solve(
         } else {
             (loose, coarse)
         };
-        let agreed_tags = distinct_tags(&agreed);
-        // A near-frontal tag admits a mirror solution with almost the same
-        // error, and that one leaves the camera below the carpet. Nobody films
-        // a field element from under the field, so it is a safe tie-break.
-        let above_ground = refined.pose.position.z > 0.0;
-        let better = match &best {
-            None => true,
-            Some((current, tags, ground)) => {
-                (agreed_tags, above_ground, -refined.rms_px) > (*tags, *ground, -current.rms_px)
+        pool.push((refined, agreed));
+    }
+    pool
+}
+
+/// Whether the pool already holds an answer worth keeping: a possible camera,
+/// at the end of the field the colours named when they named one.
+fn settled(
+    pool: &[(Solution, Vec<Correspondence>)],
+    layout: &TagLayout,
+    prefer: Option<End>,
+) -> bool {
+    pool.iter().any(|(solution, _)| {
+        trust::plausible(&solution.pose, layout, &solution.tags).is_ok()
+            && matches_preference(&solution.pose, layout, prefer)
+    })
+}
+
+fn matches_preference(pose: &CameraPose, layout: &TagLayout, prefer: Option<End>) -> bool {
+    let Some(prefer) = prefer else {
+        return true;
+    };
+    end_of_x(pose.position.x, layout.field_length) == prefer
+}
+
+/// The best pose in the pool, or the reason there is none.
+fn choose(
+    pool: Vec<(Solution, Vec<Correspondence>)>,
+    layout: &TagLayout,
+    prefer: Option<End>,
+) -> Result<Solution, String> {
+    // The closest fit is the one whose rejection explains the frame best: if
+    // the pose that fits the corners best is impossible, that is the story.
+    let mut impossible: Option<(f64, String)> = None;
+    let mut candidates: Vec<(Solution, Vec<Correspondence>)> = Vec::new();
+    for (solution, agreed) in pool {
+        match trust::plausible(&solution.pose, layout, &solution.tags) {
+            Ok(()) => candidates.push((solution, agreed)),
+            Err(reason) => {
+                let closest = impossible
+                    .as_ref()
+                    .map(|(rms, _)| solution.rms_px < *rms)
+                    .unwrap_or(true);
+                if closest {
+                    impossible = Some((solution.rms_px, reason));
+                }
             }
-        };
-        if better {
-            best = Some((refined, agreed_tags, above_ground));
         }
     }
-    best.map(|(solution, _, _)| solution)
+    if candidates.is_empty() {
+        return Err(match impossible {
+            Some((_, reason)) => reason,
+            None => "the tags seen do not determine a pose".to_string(),
+        });
+    }
+
+    // Only poses whose fit is in the same league as the best one get a vote on
+    // the side of the field: a pose that fits ten times worse is not a tie to be
+    // broken by a colour reading, it is a worse fit.
+    let best_rms = candidates
+        .iter()
+        .map(|(solution, _)| solution.rms_px)
+        .fold(f64::INFINITY, f64::min);
+    let mut ranked = candidates.into_iter().filter(|(solution, _)| {
+        solution.rms_px.is_finite() && solution.rms_px <= best_rms * 1.5 + 0.5
+    });
+    let mut best = ranked.next().expect("at least the best fit qualifies");
+    for candidate in ranked {
+        if better(&candidate.0, &best.0, layout, prefer) {
+            best = candidate;
+        }
+    }
+    Ok(best.0)
+}
+
+/// Whether `a` should be preferred to `b`: colour agreement first, then how
+/// many tags backed it, then the fit.
+fn better(a: &Solution, b: &Solution, layout: &TagLayout, prefer: Option<End>) -> bool {
+    let a_matches = matches_preference(&a.pose, layout, prefer);
+    let b_matches = matches_preference(&b.pose, layout, prefer);
+    (a_matches, a.tags.len(), -a.rms_px) > (b_matches, b.tags.len(), -b.rms_px)
+}
+
+/// Where a camera could be, as starting points for the fit.
+///
+/// The twin pose of a single square is not a small perturbation away from the
+/// right one — it is metres away, under the field or beyond it — so a seed has
+/// to be placed where a camera plausibly is, not nudged from the wrong answer.
+/// These ring the tag at broadcast heights (8m and 13m, above the boards and the
+/// stand) in several directions, at roughly the distance the homography found
+/// and somewhat beyond it, each one looking at the tag. The refinement then
+/// settles on the nearest pose that fits the corners, and there is always one
+/// that is a real camera.
+fn restart_seeds(
+    agreed: &[Correspondence],
+    layout: &TagLayout,
+    tags: &[u16],
+    origin: Vec3,
+) -> Vec<CameraPose> {
+    if agreed.is_empty() {
+        return Vec::new();
+    }
+    let centre = centre_of(agreed);
+    let mut seeds = Vec::new();
+
+    // Anchor everything on the answer that is being questioned. Even a mirror
+    // pose has the tag's bearing roughly right — it is the distance and the
+    // side of the field it gets wrong — so its bearing is the best clue there
+    // is about where to look.
+    let offset_from_tag = origin - centre;
+    let bearing = offset_from_tag.y.atan2(offset_from_tag.x);
+    let distance = offset_from_tag.norm();
+    let distance = if distance.is_finite() && distance > 0.2 {
+        distance
+    } else {
+        8.0
+    };
+
+    // Straight out from the tag's own face, at the distance the fit found and
+    // on either side of it. This is what rescues the commonest case in the
+    // fixtures and in the field: a tag so large in the frame that the camera is
+    // a metre or two away, where every seed ten metres off is useless and the
+    // wrong-side answer sits exactly behind the tag.
+    for tag in tags {
+        let Some(tag_pose) = layout.tag(*tag) else {
+            continue;
+        };
+        let normal = Mat3::from_quaternion(tag_pose.rotation).mul_vec(Vec3::new(1.0, 0.0, 0.0));
+        for scale in [0.4f64, 0.7, 1.0, 1.6, 3.0] {
+            let reach = (distance * scale).clamp(0.2, 45.0);
+            seeds.push(look_towards(
+                tag_pose.translation + normal.scaled(reach),
+                tag_pose.translation,
+            ));
+        }
+    }
+
+    // …and a ring around the tag at the heights a broadcast camera is mounted
+    // at, for the case where the camera is not on the tag's axis at all.
+    for height in [8.0, 13.0] {
+        for offset in [0.0f64, 60.0, 120.0, 180.0, 240.0, 300.0] {
+            for scale in [0.8f64, 1.4] {
+                let angle = bearing + offset.to_radians();
+                let reach = (distance * scale).clamp(1.0, 45.0);
+                seeds.push(look_towards(
+                    Vec3::new(
+                        centre.x + reach * angle.cos(),
+                        centre.y + reach * angle.sin(),
+                        height,
+                    ),
+                    centre,
+                ));
+            }
+        }
+    }
+    seeds
+}
+
+/// A pose at `position` looking straight at `target`, with the field's `+z` up.
+///
+/// Built from the camera axes rather than a rotation about some axis: writing a
+/// rotation out by hand gets the axis signs wrong every time.
+pub(crate) fn look_towards(position: Vec3, target: Vec3) -> CameraPose {
+    let forward = (target - position).normalized();
+    let up = Vec3::new(0.0, 0.0, 1.0);
+    let right = forward.cross(up);
+    let right = if right.norm() < 1e-9 {
+        // Looking straight down: any horizontal axis will do.
+        Vec3::new(1.0, 0.0, 0.0)
+    } else {
+        right.normalized()
+    };
+    let down = forward.cross(right);
+    CameraPose {
+        position,
+        // Rows are the camera axes in field coordinates: field axes to camera
+        // axes is the inverse (transpose) of that.
+        rotation: Mat3::from_rows([right.to_array(), down.to_array(), forward.to_array()])
+            .to_quaternion(),
+    }
 }
 
 /// How far a corner may miss and still count, for a tag that wide in pixels.
@@ -160,13 +409,6 @@ fn agreed_corners(
     agreed
 }
 
-fn distinct_tags(corners: &[Correspondence]) -> usize {
-    let mut tags: Vec<u16> = corners.iter().map(|corner| corner.tag).collect();
-    tags.sort_unstable();
-    tags.dedup();
-    tags.len()
-}
-
 /// The pose one tag implies, from its homography.
 fn pose_from_tag(
     observation: &TagObservation,
@@ -176,13 +418,14 @@ fn pose_from_tag(
     camera: &Intrinsics,
 ) -> Option<CameraPose> {
     // The tag face is the `y`-`z` plane of WPILib's tag frame, so each corner is
-    // described by its (y, z) pair. Same order as [`TagLayout::corners`].
+    // described by its (y, z) pair, in the same order as [`TagLayout::corners`]:
+    // top-right first, running clockwise round the picture.
     let half = tag_size * 0.5;
     let object = [
-        Vec3::new(-half, half, 0.0),
-        Vec3::new(-half, -half, 0.0),
-        Vec3::new(half, -half, 0.0),
         Vec3::new(half, half, 0.0),
+        Vec3::new(half, -half, 0.0),
+        Vec3::new(-half, -half, 0.0),
+        Vec3::new(-half, half, 0.0),
     ];
     let homography = homography_from_four(&object, &observation.corners)?;
 
@@ -250,8 +493,31 @@ fn homography_from_four(object: &[Vec3; 4], image: &[[f64; 2]; 4]) -> Option<Mat
     ]))
 }
 
+/// Reprojection error of one pose over a set of corners, in pixels.
+///
+/// The same measure [`refine`] reports, so a pose fitted to several frames can
+/// be compared with the frames it was fitted to.
+pub(crate) fn reprojection_rms(
+    pose: &CameraPose,
+    corners: &[Correspondence],
+    camera: &Intrinsics,
+) -> f64 {
+    let residuals = residuals(
+        Mat3::from_quaternion(pose.rotation),
+        pose.position,
+        corners,
+        camera,
+    );
+    let cost: f64 = residuals.iter().map(|value| value * value).sum();
+    (cost / corners.len().max(1) as f64).sqrt()
+}
+
 /// Levenberg–Marquardt over the six pose parameters.
-fn refine(start: CameraPose, corners: &[Correspondence], camera: &Intrinsics) -> Option<Solution> {
+pub(crate) fn refine(
+    start: CameraPose,
+    corners: &[Correspondence],
+    camera: &Intrinsics,
+) -> Option<Solution> {
     let mut rotation = Mat3::from_quaternion(start.rotation);
     let mut position = start.position;
     let mut lambda = 1e-3;
@@ -616,6 +882,76 @@ mod tests {
         let solution = solve(&observations, &layout, 0.1651, &camera).expect("solves");
         assert!(
             (solution.pose.position - truth.position).norm() < 0.5,
+            "position {:?} vs {:?}",
+            solution.pose.position,
+            truth.position
+        );
+    }
+
+    #[test]
+    fn one_tag_never_solves_to_the_camera_behind_it() {
+        // The bug this pins, measured on this exact geometry before it was
+        // fixed: of forty frames whose corners were moved by less than a pixel,
+        // thirteen solved to a camera eleven metres away and three metres under
+        // the carpet, looking at the roof — and eight more solved to nothing at
+        // all. The mirror fits those corners *better* than the truth did (0.06px
+        // against 0.39px), which is why reprojection error can never be the
+        // thing that rejects it.
+        let layout = test_layout(&[facing_tag(13, Vec3::new(15.5, 6.0, 0.5))]);
+        let camera = Intrinsics::from_horizontal_fov(1280, 720, 60.0);
+        let truth = look_at(Vec3::new(11.0, 2.0, 4.0), Vec3::new(15.5, 6.0, 0.5));
+        let clean = project_corners(&layout, &[13], 0.1651, truth, &camera);
+        let normal = Mat3::from_quaternion(layout.tag(13).expect("tag").rotation)
+            .mul_vec(Vec3::new(1.0, 0.0, 0.0));
+
+        let mut seed = 7u32;
+        let mut noise = || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((seed >> 8) as f64 / (1u32 << 24) as f64) - 0.5
+        };
+        let mut solved = 0;
+        for trial in 0..12 {
+            let mut noisy = clean[0].clone();
+            for corner in noisy.corners.iter_mut() {
+                corner[0] += noise() * 1.5;
+                corner[1] += noise() * 1.5;
+            }
+            let solution = solve(&[noisy], &layout, 0.1651, &camera)
+                .unwrap_or_else(|| panic!("trial {trial} found no pose at all"));
+            solved += 1;
+            let position = solution.pose.position;
+            assert!(
+                position.z > 0.0,
+                "trial {trial} put the camera {:.1}m under the carpet",
+                -position.z
+            );
+            assert!(
+                (position - layout.tag(13).unwrap().translation).dot(normal) > 0.0,
+                "trial {trial} put the camera behind the tag's face"
+            );
+            assert!(
+                (position - truth.position).norm() < 2.0,
+                "trial {trial} is {:.1}m from the camera's actual position",
+                (position - truth.position).norm()
+            );
+        }
+        assert_eq!(solved, 12);
+    }
+
+    #[test]
+    fn a_colour_reading_cannot_throw_away_the_only_pose() {
+        // The colours around a tag break a tie; they do not overrule the
+        // geometry. A red banner hung at the blue end would otherwise lose the
+        // frame entirely.
+        let layout = test_layout(&[facing_tag(3, Vec3::new(12.0, 6.0, 0.5))]);
+        let camera = Intrinsics::from_horizontal_fov(1280, 720, 60.0);
+        let truth = look_at(Vec3::new(6.0, 1.0, 4.0), Vec3::new(12.0, 6.0, 0.5));
+        let observations = project_corners(&layout, &[3], 0.1651, truth, &camera);
+        let wrong_end = Some(End::LowX);
+        let solution = solve_preferring(&observations, &layout, 0.1651, &camera, wrong_end)
+            .expect("the only pose is still a pose");
+        assert!(
+            (solution.pose.position - truth.position).norm() < 1e-6,
             "position {:?} vs {:?}",
             solution.pose.position,
             truth.position

@@ -134,23 +134,27 @@ impl TagLayout {
     }
 
     /// The four corners of a tag in field coordinates, ordered to match the
-    /// detector: top-right, bottom-right, bottom-left, top-left as seen when
-    /// facing the tag.
+    /// detector: top-right, bottom-right, bottom-left, top-left as the picture
+    /// shows them, with the camera *in front of* the tag.
     ///
-    /// WPILib's tag frame puts `+x` out of the tag face, `+y` to the left when
-    /// looking at the tag and `+z` up the tag, so a corner "right and up" in the
-    /// picture is `-y`, `+z` here. Getting this wrong does not fail loudly: the
-    /// solve still fits every corner and quietly returns a pose balanced on the
-    /// tag's edge.
+    /// WPILib's tag frame puts `+x` out of the tag face, `+y` to the left of
+    /// someone facing the tag from in front and `+z` up the tag. Standing in
+    /// front of a tag, your left is its `+y`, so the tag's `+y` runs to the
+    /// *right* of your picture and `+z` up it — the top-right corner of the
+    /// printed pattern is `(+y, +z)`. That sign is the whole of this function,
+    /// and getting it wrong does not fail loudly: every corner still fits a
+    /// pose, only the pose is the mirror of the real one, on the far side of the
+    /// wall where no camera can read a tag at all. A projected fixture with a
+    /// known camera pose is what pins it, not the tidy look of the numbers.
     pub fn corners(&self, id: u16, tag_size: f64) -> Option<[Vec3; 4]> {
         let tag = self.tag(id)?;
         let half = tag_size * 0.5;
         let rotation = Mat3::from_quaternion(tag.rotation);
         let local = [
-            Vec3::new(0.0, -half, half),
-            Vec3::new(0.0, -half, -half),
-            Vec3::new(0.0, half, -half),
             Vec3::new(0.0, half, half),
+            Vec3::new(0.0, half, -half),
+            Vec3::new(0.0, -half, -half),
+            Vec3::new(0.0, -half, half),
         ];
         Some(local.map(|corner| rotation.mul_vec(corner) + tag.translation))
     }
@@ -277,9 +281,10 @@ mod tests {
     fn corners_are_ordered_as_the_detector_reports_them() {
         use super::super::types::{CameraPose, Intrinsics, Mat3, Vec3};
 
-        // A tag facing the field's `+x`, seen head on by a camera on the `-x`
-        // side. The detector reports corners top-right, bottom-right,
-        // bottom-left, top-left, so that is the order this must come out in.
+        // A tag facing the field's `+x`, seen head on by a camera in *front* of
+        // it — on its `+x` side, which is the only side a tag can be read from.
+        // The detector reports corners top-right, bottom-right, bottom-left,
+        // top-left, so that is the order this must come out in.
         let json = r#"{
             "field": { "length": 16.0, "width": 8.0 },
             "tags": [{
@@ -293,10 +298,11 @@ mod tests {
         let layout = TagLayout::from_json("test", json).expect("layout");
         let corners = layout.corners(7, 0.165).expect("corners");
 
-        // Camera axes in field coordinates: looking along `+x`, up is `+z`.
+        // Camera axes in field coordinates: standing in front of the tag and
+        // looking back at it along `-x`, up is `+z`.
         let pose = CameraPose {
-            position: Vec3::new(2.0, 4.0, 1.0),
-            rotation: Mat3::from_rows([[0.0, -1.0, 0.0], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0]])
+            position: Vec3::new(8.0, 4.0, 1.0),
+            rotation: Mat3::from_rows([[0.0, 1.0, 0.0], [0.0, 0.0, -1.0], [-1.0, 0.0, 0.0]])
                 .to_quaternion(),
         };
         let camera = Intrinsics::from_horizontal_fov(1280, 720, 60.0);

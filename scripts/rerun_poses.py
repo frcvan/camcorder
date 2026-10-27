@@ -7,8 +7,18 @@
 * the field outline and every tag on it, in field coordinates;
 * the camera, as a pinhole plus a transform per solved frame;
 * the frame itself, at the same time, projected from that camera;
-* the camera's path, and its height / heading / pitch / roll / residual over
-  the timeline.
+* every frame of the video itself, decoded once and logged at the video's own
+  frame rate, so the picture and the plots run together;
+* the camera's path, its height / heading / pitch / roll / residual and how
+  much of a result each frame is over the timeline;
+* the one pose fitted to every frame of the station, and the focal length the
+  poses were solved with;
+* the side of the field each frame was read as: the red and blue pixel counts
+  behind the alliance verdict, that verdict, the end of the field the tags
+  stand at, and a flag on the frames where colour and geometry disagree.
+
+An overview pane has no side of the field to report — one wide shot holds both
+alliances — so its frames carry none, and its counts stay empty.
 
 One command, then look at it:
 
@@ -26,6 +36,7 @@ import json
 import math
 import subprocess
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,6 +54,15 @@ TAG_THICKNESS_M = 0.005
 #: metres and this many degrees. A broadcast camera does not move during a
 #: match; two poses that differ by more are two cameras in the same video.
 STATION_ANGLE_TOLERANCE_DEG = 12.0
+#: `-q:v` for ffmpeg's mjpeg encoder, 2 (best) to 31 (smallest). A recording that
+#: holds every frame of a match needs the pictures compressed: a raw 1080p frame
+#: is 6MB, which is 60GB for ten minutes of 60fps footage, against a few tens of
+#: kilobytes for the same frame as a JPEG.
+JPEG_QUALITY = 6
+#: `side.alliance` and `side.tags_end` as numbers, so they can be plotted. Zero
+#: is "not read": an overview pane, or a picture with no coloured elements.
+ALLIANCE_CODE = {"blue": 1.0, "mixed": 2.0, "red": 3.0}
+END_CODE = {"low_x": 1.0, "both": 2.0, "high_x": 3.0}
 
 
 @dataclass
@@ -115,7 +135,9 @@ def layout_tags(layout: dict | None) -> list[tuple[int, np.ndarray, np.ndarray]]
         tags.append(
             (
                 int(entry["ID"]),
-                np.array([translation["x"], translation["y"], translation["z"]], dtype=float),
+                np.array(
+                    [translation["x"], translation["y"], translation["z"]], dtype=float
+                ),
                 # WPILib writes WXYZ, rerun wants XYZW.
                 np.array(
                     [
@@ -269,7 +291,11 @@ def cluster_frames(
                 np.linalg.norm(position - np.array(reference["position"], dtype=float))
                 <= position_tol
             )
-            if near and quaternion_angle_deg(rotation, camera_rotation(reference)) <= angle_tol:
+            if (
+                near
+                and quaternion_angle_deg(rotation, camera_rotation(reference))
+                <= angle_tol
+            ):
                 cluster.append(frame)
                 break
         else:
@@ -287,7 +313,7 @@ def log_camera_static(entity: str, camera: Camera) -> None:
             focal_length=fx,
             principal_point=(cx, cy),
             camera_xyz=rr.ViewCoordinates.RDF,
-            image_plane_distance=1.0,
+            image_plane_distance=2.0,
         ),
         static=True,
     )
@@ -295,7 +321,9 @@ def log_camera_static(entity: str, camera: Camera) -> None:
 
 def log_trajectory(name: str, clusters: list[list[dict]]) -> None:
     """The camera stations, in world coordinates so they never move with a pose."""
-    strips = [np.array([frame["position"] for frame in cluster]) for cluster in clusters]
+    strips = [
+        np.array([frame["position"] for frame in cluster]) for cluster in clusters
+    ]
     if not strips:
         return
     rr.log(
@@ -311,40 +339,115 @@ def log_trajectory(name: str, clusters: list[list[dict]]) -> None:
     )
 
 
-def read_frame(video: Path, time: float, width: int, height: int) -> np.ndarray | None:
-    """One RGB frame at `time`, or None if ffmpeg cannot give us one."""
+def video_fps(video: Path) -> float:
+    """The video's average frame rate, or 30 when ffprobe will not say.
+
+    Every frame of the video is decoded, so the times have to come from the
+    frame rate rather than from the report: the report samples a handful of
+    frames, and the recording now holds all of them.
+    """
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=r_frame_rate",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        str(video),
+    ]
+    try:
+        output = subprocess.run(command, capture_output=True, check=False, text=True)
+    except FileNotFoundError:
+        return 30.0
+    rate = output.stdout.strip()
+    try:
+        if "/" in rate:
+            numerator, denominator = rate.split("/", 1)
+            fps = float(numerator) / float(denominator)
+        else:
+            fps = float(rate)
+    except (ValueError, ZeroDivisionError):
+        return 30.0
+    return fps if 1.0 < fps < 1000.0 else 30.0
+
+
+def iter_video_jpegs(
+    video: Path, limit: int | None = None
+) -> Iterator[tuple[int, bytes]]:
+    """Every frame of the video, as `(index, JPEG bytes)`, decoded once.
+
+    One ffmpeg process for the whole file rather than a seek per frame: seeking
+    to each timestamp re-runs the decoder from the nearest keyframe, which for a
+    few thousand frames is minutes of work instead of seconds. ffmpeg does the
+    compression as it decodes, so the frames are handed over as the JPEGs the
+    recording will store rather than as raw pixels to compress here.
+    """
     command = [
         "ffmpeg",
         "-hide_banner",
         "-v",
         "error",
         "-nostdin",
-        "-ss",
-        f"{time:.3f}",
         "-i",
         str(video),
-        "-frames:v",
-        "1",
         "-an",
         "-sn",
+        "-c:v",
+        "mjpeg",
+        "-q:v",
+        str(JPEG_QUALITY),
         "-f",
-        "rawvideo",
-        "-pix_fmt",
-        "rgb24",
+        "mjpeg",
         "-",
     ]
     try:
-        output = subprocess.run(command, capture_output=True, check=False)
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
     except FileNotFoundError:
-        print("warning: ffmpeg not found — logging poses without video", file=sys.stderr)
-        return None
-    expected = width * height * 3
-    if output.returncode != 0 or len(output.stdout) != expected:
-        return None
-    return np.frombuffer(output.stdout, dtype=np.uint8).reshape(height, width, 3)
+        print(
+            "warning: ffmpeg not found — logging poses without video", file=sys.stderr
+        )
+        return
+
+    # Start of image. Everything between one and the next is one JPEG: entropy
+    # coded data byte-stuffs any 0xFF it contains, so the marker cannot appear
+    # inside a frame.
+    soi = b"\xff\xd8\xff"
+    index = 0
+    buffer = bytearray()
+    try:
+        assert process.stdout is not None
+        while limit is None or index < limit:
+            chunk = process.stdout.read(1 << 20)
+            if not chunk:
+                break
+            buffer += chunk
+            while limit is None or index < limit:
+                start = buffer.find(soi)
+                if start < 0:
+                    break
+                following = buffer.find(soi, start + len(soi))
+                if following < 0:
+                    del buffer[:start]
+                    break
+                frame = bytes(buffer[start:following])
+                del buffer[:following]
+                if not frame.rstrip(b"\x00").endswith(b"\xff\xd9"):
+                    continue
+                yield index, frame
+                index += 1
+    finally:
+        if process.stdout is not None:
+            process.stdout.close()
+        process.kill()
+        process.wait()
 
 
-def log_frames(camera: Camera, cluster: list[dict], entity: str, with_video: bool, budget: list[int]) -> None:
+def log_frames(camera: Camera, cluster: list[dict], entity: str) -> None:
     """One camera station: where it stood, and what it saw while it stood there.
 
     The transform goes on the entity itself and the pinhole on its child, which
@@ -352,9 +455,6 @@ def log_frames(camera: Camera, cluster: list[dict], entity: str, with_video: boo
     below a pinhole applies to that child only, leaving the camera at the origin
     looking straight up.
     """
-    width = int(camera.report["frame_width"])
-    height = int(camera.report["frame_height"])
-
     for frame in cluster:
         rr.set_time("video_time", duration=float(frame["time"]))
         rr.set_time("frame", sequence=int(float(frame["time"]) * 1000))
@@ -363,7 +463,9 @@ def log_frames(camera: Camera, cluster: list[dict], entity: str, with_video: boo
             entity,
             rr.Transform3D(
                 translation=np.array(frame["position"], dtype=float),
-                rotation=rr.Quaternion(xyzw=[float(value) for value in camera_rotation(frame)]),
+                rotation=rr.Quaternion(
+                    xyzw=[float(value) for value in camera_rotation(frame)]
+                ),
             ),
         )
 
@@ -377,13 +479,112 @@ def log_frames(camera: Camera, cluster: list[dict], entity: str, with_video: boo
         rr.log(f"{plot}/roll", rr.Scalars(frame["roll_deg"]))
         rr.log(f"{plot}/reprojection_rms", rr.Scalars(frame["rms_px"]))
         rr.log(f"{plot}/tags_used", rr.Scalars(len(frame["tags"])))
+        if "confidence" in frame:
+            rr.log(f"{plot}/confidence", rr.Scalars(frame["confidence"]))
+        if "weakest_margin" in frame:
+            rr.log(f"{plot}/weakest_margin", rr.Scalars(frame["weakest_margin"]))
+        log_side(frame, plot)
 
-        if not with_video or camera.video is None or budget[0] <= 0:
-            continue
-        image = read_frame(camera.video, float(frame["time"]), width, height)
-        if image is not None:
-            rr.log(f"{entity}/image", rr.Image(image))
-            budget[0] -= 1
+
+def log_side(frame: dict, plot: str) -> None:
+    """The side of the field this frame was read as, when it was read at all.
+
+    The pixel counts are logged as they are, because they are the evidence: a
+    verdict of "red" from 40 red pixels against 35 blue ones is not the same
+    finding as one from 40,000 against two, and only the counts show which
+    happened.
+    """
+    side = frame.get("side")
+    if not side:
+        return
+    rr.log(f"{plot}/red_pixels", rr.Scalars(side["red_pixels"]))
+    rr.log(f"{plot}/blue_pixels", rr.Scalars(side["blue_pixels"]))
+    rr.log(f"{plot}/alliance", rr.Scalars(ALLIANCE_CODE.get(side["alliance"], 0.0)))
+    rr.log(f"{plot}/tags_end", rr.Scalars(END_CODE.get(side["tags_end"], 0.0)))
+    rr.log(
+        f"{plot}/side_disagrees",
+        rr.Scalars(1.0 if side.get("disagreement") else 0.0),
+    )
+
+
+def log_video(
+    camera: Camera,
+    clusters: list[list[dict]],
+    entities: list[str],
+    max_frames: int | None,
+) -> None:
+    """Every frame of the video, at its own timestamp.
+
+    The report samples ten frames out of a match; logging only those leaves the
+    viewer with ten stills and a timeline that jumps. Decoding the file once and
+    logging every frame gives the recording the video's own frame rate, so the
+    camera's picture and its plots run together the way the footage did.
+
+    Each image goes to whichever station's solved frames are nearest in time, so
+    a file that holds two cameras keeps each one's pictures on its own entity.
+    """
+    if camera.video is None or not clusters:
+        return
+    fps = video_fps(camera.video)
+    spans = [
+        (
+            min(float(frame["time"]) for frame in cluster),
+            max(float(frame["time"]) for frame in cluster),
+        )
+        for cluster in clusters
+    ]
+
+    def station_for(time: float) -> int:
+        def distance(span: tuple[float, float]) -> float:
+            low, high = span
+            if low <= time <= high:
+                return 0.0
+            return min(abs(time - low), abs(time - high))
+
+        return min(range(len(spans)), key=lambda index: distance(spans[index]))
+
+    logged = 0
+    for index, jpeg in iter_video_jpegs(camera.video, max_frames):
+        time = index / fps
+        rr.set_time("video_time", duration=time)
+        rr.set_time("frame", sequence=index)
+        rr.log(
+            f"{entities[station_for(time)]}/image",
+            rr.EncodedImage(contents=jpeg, media_type="image/jpeg"),
+        )
+        logged += 1
+        if logged % 600 == 0:
+            print(f"  {camera.name}: {logged} frame(s)…", file=sys.stderr)
+    print(
+        f"  {camera.name}: logged {logged} frame(s) of video at {fps:.0f}fps",
+        file=sys.stderr,
+    )
+
+
+def log_station(camera: Camera) -> None:
+    """The one pose fitted to every frame the camera stood still for.
+
+    Drawn as a marker rather than replacing the per-frame transforms: a camera
+    that really did pan has to keep showing as having panned, and this is the
+    consensus it panned away from.
+    """
+    station = camera.report.get("station")
+    if not station:
+        return
+    position = [float(value) for value in station["position"]]
+    rr.log(
+        f"world/stations/{camera.name}",
+        rr.Points3D(
+            [position],
+            colors=[(255, 200, 90)],
+            radii=0.08,
+            labels=[
+                f"{camera.name} station: {station['frames_used']} frame(s), "
+                f"rms {float(station['rms_px']):.1f}px"
+            ],
+        ),
+        static=True,
+    )
 
 
 def usable(frame: dict, min_height: float | None) -> bool:
@@ -396,6 +597,26 @@ def usable(frame: dict, min_height: float | None) -> bool:
     if min_height is None:
         return True
     return float(frame["position"][2]) >= min_height
+
+
+def summarise_side(cluster: list[dict]) -> str:
+    """One camera station's side of the field, for the terminal."""
+    verdicts = [frame["side"] for frame in cluster if frame.get("side")]
+    if not verdicts:
+        return ""
+    alliances: dict[str, int] = {}
+    for side in verdicts:
+        alliances[side["alliance"]] = alliances.get(side["alliance"], 0) + 1
+    counts = ", ".join(
+        f"{count} {alliance}" for alliance, count in sorted(alliances.items())
+    )
+    disagreeing = [side for side in verdicts if side.get("disagreement")]
+    line = f"\n    side of the field: {counts}"
+    for side in disagreeing[:3]:
+        line += f"\n      read against the geometry: {side['disagreement']}"
+    if len(disagreeing) > 3:
+        line += f"\n      … and {len(disagreeing) - 3} more like it"
+    return line
 
 
 def log_pose(
@@ -417,18 +638,24 @@ def log_pose(
 
     clusters = cluster_frames(kept, station_tolerance, STATION_ANGLE_TOLERANCE_DEG)
     log_trajectory(camera.name, clusters)
+    log_station(camera)
 
-    budget = [max_frames if max_frames is not None else len(kept)]
-    for index, cluster in enumerate(clusters):
-        # A single station is just the camera; several get a name each, since
-        # they are different cameras that happened to be measured in one file.
-        entity = (
+    # A single station is just the camera; several get a name each, since they
+    # are different cameras that happened to be measured in one file.
+    entities = [
+        (
             f"world/cameras/{camera.name}"
             if len(clusters) == 1
             else f"world/cameras/{camera.name}/cam{index + 1}"
         )
+        for index in range(len(clusters))
+    ]
+    for entity, cluster in zip(entities, clusters):
         log_camera_static(entity, camera)
-        log_frames(camera, cluster, entity, with_video, budget)
+        log_frames(camera, cluster, entity)
+
+    if with_video:
+        log_video(camera, clusters, entities, max_frames)
     return clusters
 
 
@@ -469,7 +696,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--max-frames",
         type=int,
         metavar="N",
-        help="decode at most N frames per camera",
+        help="decode at most N frames of video per camera",
     )
     parser.add_argument(
         "--station-tolerance",
@@ -546,15 +773,29 @@ def main(argv: list[str] | None = None) -> int:
             f"{len(stations)} camera station(s), tags {report.get('tags_seen', [])}, "
             f"{'video' if camera.video and not args.no_video else 'no video'}"
         )
+        station = report.get("station")
+        if station:
+            position = [float(value) for value in station["position"]]
+            print(
+                f"  fitted station pose: ({position[0]:.2f}, {position[1]:.2f}, "
+                f"{position[2]:.2f})m from {station['frames_used']} frame(s), "
+                f"{station['frames_rejected']} rejected, rms "
+                f"{float(station['rms_px']):.1f}px"
+            )
+        if report.get("focal_source"):
+            print(f"  {report['focal_source']}")
         for index, cluster in enumerate(stations):
             heights = [float(frame["position"][2]) for frame in cluster]
             span = max(heights) - min(heights)
             print(
                 f"  station {index + 1}: {len(cluster)} frame(s), "
                 f"height {sum(heights) / len(heights):.2f}m (±{span / 2:.2f}m)"
+                f"{summarise_side(cluster)}"
             )
         if not stations:
-            print(f"  note: {camera.name} has no solved frames to show", file=sys.stderr)
+            print(
+                f"  note: {camera.name} has no solved frames to show", file=sys.stderr
+            )
     return 0
 
 

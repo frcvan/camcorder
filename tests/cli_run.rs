@@ -251,7 +251,10 @@ fn run_pulls_stats_downloads_the_video_and_splits_it() {
         "match row missing:\n{stdout}"
     );
     // --verbose dumps the raw breakdown for our alliance.
-    assert!(stdout.contains("totalPoints"), "breakdown missing:\n{stdout}");
+    assert!(
+        stdout.contains("totalPoints"),
+        "breakdown missing:\n{stdout}"
+    );
 
     // …and the full response is saved untouched.
     let saved: serde_json::Value = serde_json::from_slice(
@@ -262,7 +265,11 @@ fn run_pulls_stats_downloads_the_video_and_splits_it() {
 
     // The stub was asked with the key from .env.
     let requests = stub.seen_requests();
-    assert_eq!(requests.len(), 2, "expected the matches and the video request");
+    assert_eq!(
+        requests.len(),
+        2,
+        "expected the matches and the video request"
+    );
     let matches_request = requests
         .iter()
         .find(|head| head.contains("/team/frc254/matches/2025"))
@@ -300,7 +307,11 @@ fn a_rejected_api_key_is_explained() {
     sandbox.write_inputs();
 
     let stub = start_stub(1, |_base_url| {
-        vec![("/api/v3/team/frc254/matches/2025".to_string(), 401, Vec::new())]
+        vec![(
+            "/api/v3/team/frc254/matches/2025".to_string(),
+            401,
+            Vec::new(),
+        )]
     });
 
     let output = sandbox.camcorder(&stub.base_url, &["stats"]);
@@ -315,11 +326,8 @@ fn a_rejected_api_key_is_explained() {
 #[test]
 fn a_missing_api_key_is_explained() {
     let sandbox = Sandbox::new();
-    std::fs::write(
-        sandbox.path("camcorder.toml"),
-        "team = 254\nyear = 2025\n",
-    )
-    .expect("write config");
+    std::fs::write(sandbox.path("camcorder.toml"), "team = 254\nyear = 2025\n")
+        .expect("write config");
 
     let output = sandbox.camcorder("http://127.0.0.1:1/api/v3", &["stats"]);
     let stderr = String::from_utf8_lossy(&output.stderr);

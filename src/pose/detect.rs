@@ -28,12 +28,14 @@ impl TagDetector {
         Ok(TagDetector { decoder, size })
     }
 
-    /// Tags in one frame. `gray` is `width * height` bytes, top row first.
+    /// Every tag the decoder finds in one frame, weak ones included.
     ///
-    /// Detections whose colour margin is below `min_margin` are dropped: on
-    /// broadcast video the far tags are a few pixels across, and a marginal
-    /// read of those is worse than no read at all.
-    pub fn detect(&mut self, gray: &[u8], min_margin: f32) -> Result<Vec<TagObservation>> {
+    /// `gray` is `width * height` bytes, top row first. Nothing is filtered
+    /// here on purpose: how much margin a read deserves depends on how big the
+    /// tag is and on whether other frames saw the same id, which is
+    /// [`super::trust`]'s business. Filtering in the detector would throw the
+    /// far tags away before anything could notice that they are real.
+    pub fn detect(&mut self, gray: &[u8]) -> Result<Vec<TagObservation>> {
         let expected = self.size.width * self.size.height;
         if gray.len() != expected {
             anyhow::bail!(
@@ -52,9 +54,6 @@ impl TagDetector {
 
         let mut out = Vec::with_capacity(detections.len());
         for detection in detections {
-            if detection.decision_margin < min_margin {
-                continue;
-            }
             out.push(TagObservation {
                 id: detection.id,
                 corners: [

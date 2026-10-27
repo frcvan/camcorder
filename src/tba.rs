@@ -64,7 +64,9 @@ impl TbaClient {
             };
             bail!("The Blue Alliance returned {status} for {url}{hint}");
         }
-        response.text().with_context(|| format!("reading body of {url}"))
+        response
+            .text()
+            .with_context(|| format!("reading body of {url}"))
     }
 }
 
@@ -345,7 +347,11 @@ pub fn render_summary(matches: &[Match], team: u32, year: u16) -> String {
             .filter(|m| m.outcome_for(team) == Some(outcome))
             .count()
     };
-    let (wins, losses, ties) = (count(Outcome::Win), count(Outcome::Loss), count(Outcome::Tie));
+    let (wins, losses, ties) = (
+        count(Outcome::Win),
+        count(Outcome::Loss),
+        count(Outcome::Tie),
+    );
 
     let _ = writeln!(
         out,
@@ -400,7 +406,12 @@ pub fn render_summary(matches: &[Match], team: u32, year: u16) -> String {
             values.iter().sum::<f64>() / values.len() as f64
         }
     }
-    let avg_our = mean(played.iter().filter_map(|m| m.our_score(team)).map(|s| s as f64));
+    let avg_our = mean(
+        played
+            .iter()
+            .filter_map(|m| m.our_score(team))
+            .map(|s| s as f64),
+    );
     let avg_opp = mean(
         played
             .iter()
@@ -415,8 +426,14 @@ pub fn render_summary(matches: &[Match], team: u32, year: u16) -> String {
         );
     }
 
-    let no_video = ours.iter().filter(|m| m.preferred_video().is_none()).count();
-    let no_breakdown = ours.iter().filter(|m| m.breakdown_for(team).is_none()).count();
+    let no_video = ours
+        .iter()
+        .filter(|m| m.preferred_video().is_none())
+        .count();
+    let no_breakdown = ours
+        .iter()
+        .filter(|m| m.breakdown_for(team).is_none())
+        .count();
     let _ = writeln!(
         out,
         "coverage: {}/{} with video · {}/{} with score breakdown",

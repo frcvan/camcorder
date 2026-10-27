@@ -9,7 +9,7 @@ camera was from the AprilTags in the picture.
 | what | command |
 | --- | --- |
 | build | `cargo build --release` |
-| test everything | `cargo test` (62 tests: 53 unit, 3 CLI, 6 video pipeline) |
+| test everything | `cargo test` (102 tests: 88 unit, 3 CLI, 5 pose pipeline, 6 video pipeline) |
 | one area | `cargo test --lib pose` / `cargo test --test views_pipeline` |
 | lint | `cargo clippy --all-targets` |
 | format | `rustfmt --edition 2021 <files you touched>` |
@@ -21,6 +21,9 @@ camera was from the AprilTags in the picture.
 External tools, run as child processes and required on `PATH`: `ffmpeg`,
 `ffprobe`, `yt-dlp`. There is no mocking of them — tests build real videos with
 `ffmpeg` and check real pixels.
+
+The Python tooling (`rerun-sdk`, `numpy`, `mypy`) lives in `.venv/` when there is
+one; use `.venv/bin/python` and `.venv/bin/rerun` rather than the system ones.
 
 Do **not** run `cargo fmt` across the repo: it is not rustfmt-clean, and a
 whole-tree pass would bury the change in unrelated churn. Format only the files
@@ -36,9 +39,14 @@ src/video.rs     ffmpeg: probe, scene cuts, divider detection, cropping
 src/pose/        camera pose from AprilTags — self-contained subsystem
   types.rs       Vec3/Mat3/Quat/Intrinsics/CameraPose, no dependencies
   layout.rs      WPILib field layouts and tag corners
-  frames.rs      greyscale frame sampling (owns all ffmpeg use)
+  frames.rs      RGB frame sampling (owns all ffmpeg use) and luma from it
+  enhance.rs     contrast stretch + unsharp, before the decoder sees a frame
   detect.rs      36h11 detection (the only file that knows kornia)
-  solve.rs       planar init + Levenberg-Marquardt refinement
+  corners.rs     sub-pixel corners: the tag's borders fitted and intersected
+  solve.rs       planar init, Levenberg-Marquardt refinement, branch choice
+  trust.rs       margin floors, tag-id voting, physical gates, confidence
+  station.rs     focal length measured from the frames, one pose per station
+  side.rs        alliance colour, field end, and the overview-pane rule
   report.rs      FramePose/PoseReport, table and JSON output
 assets/tags/     WPILib field layouts, verbatim (see their README)
 scripts/         rerun_poses.py
@@ -51,26 +59,69 @@ whole directory with it.
 ## Things that will bite you
 
 **The tag frame is not the intuitive one.** WPILib's tag frame puts `+x` *out of
-the tag face*, `+y` to the left when looking at the tag and `+z` up the tag. A
-corner "right and up in the picture" is `-y, +z` locally. Getting this wrong does
-not fail loudly: the solve still fits every corner and quietly returns a pose
-balanced on the tag edge. `TagLayout::corners` is the single place this mapping
-lives, and a test pins the corner order to what the detector reports.
+the tag face*, `+y` to the left of someone facing the tag and `+z` up the tag.
+Standing in front of a tag, your left is its `+y`, so in the picture the tag's
+`+y` runs to the *right* and `+z` up it: the top-right corner of the printed
+pattern is `(+y, +z)`, and that is the order `TagLayout::corners` returns.
+Getting the sign wrong does not fail loudly — every corner still fits a pose,
+and the pose is the mirror of the real one, on the far side of the wall where no
+camera could have read the tag. It *was* wrong: the only test of the order
+projected the tag from behind it, so it agreed with the bug, and every pose was
+a mirror. What pins it now is a fixture in `tests/pose_pipeline.rs` that draws a
+tag by intersecting each pixel's ray with the tag plane from a known camera and
+asserts the solve comes back to that camera's position.
 
-**One tag cannot pin a pose.** A planar target has two mirror solutions that
-reproject identically; from a single tag nothing in the picture separates them.
-`pose_from_tag` returns one candidate — it normalises the homography's arbitrary
-sign, and the frame loop prefers a pose above the carpet — which leaves the
-mirror able to win, so some frames come out underground or far off-field. That
-is a known limitation, not a bug in the layout data. Poses
-from one tag are also scaled by the assumed `--fov`, so they can be
-self-consistent with a sub-pixel fit and still be metres out. Trust frames with
-two or more agreeing tags. `scripts/rerun_poses.py --min-height` drops the
-below-carpet ones, and the `tags` column in the report says how many were used.
+**One tag is weak evidence, and its twin is impossible.** A single square has two
+poses that reproject its corners to the same pixels, and with real corner noise
+the wrong one often fits *better* — 0.06px against the truth's 0.39px on the
+fixture that prompted this. The fit cannot choose between them, so physics does:
+`trust::plausible` rejects a camera below the carpet, behind the face of a tag it
+read, rolled more than 40°, or looking up at the field. When the homography's
+answer is impossible, or sits at the other end of the field from the one the
+colours name, `solve` restarts from a ring of seeds around the tag and keeps the
+possible pose that fits within 1.5x of the best. What is left is honest: a
+single-tag frame scores ~0.5 confidence (0.7 once the lens is measured) against
+~1 for three tags, and `--min-confidence` drops the weak ones on request.
+
+**The lens is measured, not assumed.** `--fov` is only a seed. Two tags a known
+distance apart fix the focal length from the picture itself, and a frame that
+fits better at some other focal length says so; the median across frames is used
+and every frame is re-solved with it. A single tag can never do this — that is
+exactly why its pose is scaled by whatever focal length you assumed. Two guards
+keep the measurement honest, and both were added after real footage broke it:
+**one frame never sets the lens** (a single pane frame holding two tags 36 cm
+apart "measured" 50% below the guess, halving every distance in the video and
+putting the camera at knee height inside the field), and **a minimum sitting on
+the edge of the search range is not a measurement** — the search ran out of room,
+so the number is the bound rather than anything the picture said. On broadcast
+panes the tags are 15–17 px wide, which leaves the scale genuinely uncertain:
+sweeping the focal from 400px to 1000px moves the camera 2–3 m with the
+reprojection flat at 0.25–0.35 px. Trust the direction and the side reading from
+that footage, not the metres.
+
+**The camera stood still, so fit one pose to it.** `station` fits a single pose to
+every frame's corners, dropping frames that disagree (a pan, or a bad solve). The
+per-frame poses stay in the report: a camera that really panned has to keep
+showing as having panned.
 
 **Cameras in the stands are outside the field.** Positions like y = 12–14 m on
 an 8 m-wide field are correct broadcast camera positions, not bugs. Underground
-(z < 0) is the impossible one.
+(z < 0) is the impossible one, and the gates reject it: a frame whose only solve
+is impossible is reported in `missed` with the reason rather than in `solved`.
+
+**The overview pane is named, not detected.** The splitter writes the top pane
+of every segment as `segNN_view1.mp4`, and `pose` takes that for the wide
+overview, which holds both alliances and so gets no side-of-field reading at all
+(its frames carry none in the JSON). A `view1` that is really a sub-view, or a
+hand-cut clip, only needs renaming to be read.
+
+**Frame enhancement is on by default and is not cosmetic.** `pose` stretches the
+contrast and sharpens each sampled frame before the detector sees it, which is
+what makes a faint tag readable at all (a tag whose border is 28 luma levels
+above its quiet zone is not decoded at all as the frames stand, and reads with a
+decision margin of 105 once stretched). `--no-preprocess` measures
+the frames as they are; use it when checking whether a change to `enhance` is
+what moved a number.
 
 **A tiled frame is several cameras.** A broadcast frame holds an overview plus
 two sub-views, so tags detected in one frame can belong to different physical
@@ -81,7 +132,9 @@ Group by pose before treating them as one thing: that is what
 **In Rerun, the transform must be on the camera entity, not below the pinhole.**
 A `Transform3D` logged at `<camera>/pose` while the `Pinhole` sits at `<camera>`
 applies to the child only, leaving the camera stuck at the origin looking up.
-Log `Transform3D` on the camera entity and `Pinhole` + `Image` on its child. The
+Log `Transform3D` on the camera entity and `Pinhole` + the frame on its child —
+an `EncodedImage` of an ffmpeg-produced JPEG, since every frame of a match is
+logged and raw frames would be 60GB. The
 report's quaternion is field-to-camera (it projects field points into the
 picture) whereas a Rerun transform places camera axes in the world, so it is
 conjugated; using it as-is draws a frustum pointing backwards.
@@ -112,3 +165,10 @@ checked rather than in the foreground.
 
 `[output] dir`, or `--output-dir`, else `$TMPDIR/camcorder` — match JSON,
 downloaded video, split views, and `poses/<file>.json`. `/output` is gitignored.
+
+`output/demo.rrd` is a small recording for checking the viewer side of things: a
+projected fixture of two tags in a 3 s clip, its pose report, and all 90 video
+frames logged at 30fps. The video and report it was built from are in
+`output/demo/`, so the recording can be rebuilt with
+`.venv/bin/python scripts/rerun_poses.py output/demo/poses --rrd output/demo.rrd`
+after a change to the script.

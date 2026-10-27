@@ -422,13 +422,7 @@ fn crops_a_tiled_grid_and_splits_scenes() {
                 "top-left view, far corner",
             );
             assert_colour(
-                colour(
-                    0,
-                    3,
-                    0.5,
-                    bottom_right.width - 20,
-                    bottom_right.height - 20,
-                ),
+                colour(0, 3, 0.5, bottom_right.width - 20, bottom_right.height - 20),
                 &[0, 1],
                 "bottom-right view, far corner",
             );
@@ -541,11 +535,19 @@ fn leaves_a_single_view_video_alone() {
         video::split_views(&input, &dest, &options(SplitMode::Both, Layout::Auto)).expect("splits");
 
     assert!(report.is_single_view_throughout());
-    assert_eq!(report.segments.len(), 1, "a steady clip has no scene changes");
+    assert_eq!(
+        report.segments.len(),
+        1,
+        "a steady clip has no scene changes"
+    );
     assert_eq!(report.segments[0].source, LayoutSource::Single);
     assert_eq!(report.outputs.len(), 1);
     let info = video::probe(&dest.join("seg01_view1.mp4")).expect("output probes");
-    assert_eq!((info.width, info.height), (1280, 720), "frame must be untouched");
+    assert_eq!(
+        (info.width, info.height),
+        (1280, 720),
+        "frame must be untouched"
+    );
 }
 
 #[test]
@@ -565,7 +567,11 @@ fn crops_side_by_side_views_with_a_configured_layout() {
     .expect("splits");
 
     assert_eq!(report.segments[0].source, LayoutSource::Configured);
-    assert_eq!(report.segments.len(), 1, "tiled mode does not cut on scenes");
+    assert_eq!(
+        report.segments.len(),
+        1,
+        "tiled mode does not cut on scenes"
+    );
     assert_eq!(report.outputs.len(), 2);
 
     let info = video::probe(&dest.join("seg01_view1.mp4")).expect("left view probes");
@@ -590,8 +596,8 @@ fn scenes_only_mode_never_crops() {
     build_tiled_video(&input);
     let dest = temp.path("views");
 
-    let report =
-        video::split_views(&input, &dest, &options(SplitMode::Scenes, Layout::Auto)).expect("splits");
+    let report = video::split_views(&input, &dest, &options(SplitMode::Scenes, Layout::Auto))
+        .expect("splits");
 
     assert_eq!(report.outputs.len(), 2, "one file per segment");
     for name in sorted_file_names(&dest) {

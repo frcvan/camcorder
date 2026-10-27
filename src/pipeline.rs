@@ -149,9 +149,7 @@ pub fn download_match_videos(
                 path,
                 source: video.describe(),
             }),
-            Err(error) => outcome
-                .failed
-                .push((m.key.clone(), format!("{error:#}"))),
+            Err(error) => outcome.failed.push((m.key.clone(), format!("{error:#}"))),
         }
     }
 
@@ -219,6 +217,9 @@ mod tests {
         assert_eq!(options.crf, 20);
         assert!(options.force);
         assert!(!options.mode.splits_scenes());
-        assert_eq!(options.layout, crate::config::Layout::Grid(video::Grid::new(2, 2).unwrap()));
+        assert_eq!(
+            options.layout,
+            crate::config::Layout::Grid(video::Grid::new(2, 2).unwrap())
+        );
     }
 }

@@ -72,7 +72,11 @@ enum Command {
         /// Video file to measure.
         video: PathBuf,
         /// Bundled tag layout name, or a path to a WPILib field layout JSON.
-        #[arg(long, value_name = "NAME|FILE", default_value = "2025-reefscape-welded")]
+        #[arg(
+            long,
+            value_name = "NAME|FILE",
+            default_value = "2025-reefscape-welded"
+        )]
         tag_layout: String,
         /// Horizontal field of view of the camera, in degrees.
         #[arg(long, value_name = "DEG", default_value_t = 60.0)]
@@ -89,6 +93,14 @@ enum Command {
         /// Where to write the JSON report (defaults to <output dir>/poses/<stem>.json).
         #[arg(long, value_name = "FILE")]
         json: Option<PathBuf>,
+        /// Measure the frames as they are, without the local contrast and
+        /// sharpening that normally run first.
+        #[arg(long)]
+        no_preprocess: bool,
+        /// Drop solved frames below this confidence, 0 to 1. A single-tag frame
+        /// is about 0.5, one pinned by three tags is about 1.
+        #[arg(long, value_name = "0..1", default_value_t = 0.0)]
+        min_confidence: f64,
     },
     /// Whole pipeline: stats, then video, then views. This is the default.
     Run,
@@ -127,12 +139,24 @@ fn run() -> Result<()> {
         samples,
         window,
         json,
+        no_preprocess,
+        min_confidence,
     } = &command
     {
         let dest = json
             .clone()
             .unwrap_or_else(|| default_pose_file(&paths, video));
-        return measure_pose(video, tag_layout, *fov, *tag_size, *samples, window.clone(), &dest);
+        let options = camcorder::pose::PoseOptions {
+            tag_layout: tag_layout.clone(),
+            horizontal_fov_deg: *fov,
+            tag_size_m: *tag_size,
+            samples: *samples,
+            window: window.clone().map(|window| (window[0], window[1])),
+            preprocess: !*no_preprocess,
+            min_confidence: *min_confidence,
+            ..camcorder::pose::PoseOptions::default()
+        };
+        return measure_pose(video, &options, &dest);
     }
     if let Command::Views { video, out } = &command {
         let dest = out
@@ -162,8 +186,7 @@ fn run() -> Result<()> {
         return Ok(());
     }
 
-    let downloads =
-        pipeline::download_match_videos(&config, &paths, &fetched.matches, cli.force)?;
+    let downloads = pipeline::download_match_videos(&config, &paths, &fetched.matches, cli.force)?;
     eprintln!(
         "[download] {} video(s) ready · {} without a downloadable video",
         downloads.ok.len(),
@@ -221,10 +244,7 @@ fn print_segments(report: &camcorder::video::SplitReport) {
         eprintln!(
             "[views]   seg{:02}  {:>15}  {:<7} [{}]  {}",
             segment.segment.index + 1,
-            format!(
-                "{:.1}s-{:.1}s",
-                segment.segment.start, segment.segment.end
-            ),
+            format!("{:.1}s-{:.1}s", segment.segment.start, segment.segment.end),
             view_word(segment.layout.views()),
             segment.source,
             segment.layout.describe(),
@@ -271,42 +291,36 @@ fn default_pose_file(paths: &Paths, video: &Path) -> PathBuf {
     paths.root.join("poses").join(format!("{stem}.json"))
 }
 
-fn measure_pose(
-    video: &Path,
-    tag_layout: &str,
-    fov: f64,
-    tag_size: f64,
-    samples: usize,
-    window: Option<Vec<f64>>,
-    dest: &Path,
-) -> Result<()> {
-    let options = camcorder::pose::PoseOptions {
-        tag_layout: tag_layout.to_string(),
-        horizontal_fov_deg: fov,
-        tag_size_m: tag_size,
-        samples,
-        window: window.map(|window| (window[0], window[1])),
-        ..camcorder::pose::PoseOptions::default()
-    };
-    let report = camcorder::pose::estimate(video, &options)?;
+fn measure_pose(video: &Path, options: &camcorder::pose::PoseOptions, dest: &Path) -> Result<()> {
+    let report = camcorder::pose::estimate(video, options)?;
     eprintln!(
-        "[pose] {} ({}x{} · {} tags seen · {} · fov {:.0}° · tag {:.1}cm)",
+        "[pose] {} ({}x{} · {} tags seen · {} · tag {:.1}cm · {})",
         video.display(),
         report.frame_width,
         report.frame_height,
         report.tags_seen.len(),
         report.tag_layout,
-        report.horizontal_fov_deg,
         report.tag_size_m * 100.0,
+        if options.preprocess {
+            "enhanced"
+        } else {
+            "raw frames"
+        },
     );
+    eprintln!("[pose] {}", report.focal_source);
     print!("{}", report.render_table());
     if let Some(height) = report.median_height() {
         eprintln!("[pose] median camera height {height:.2}m");
     }
     if let Some(best) = report.best() {
         eprintln!(
-            "[pose] best frame {:.1}s · rms {:.1}px · at ({:.2}, {:.2}, {:.2})m",
-            best.time, best.rms_px, best.position[0], best.position[1], best.position[2]
+            "[pose] most confident frame {:.1}s · confidence {:.2} · rms {:.1}px · at ({:.2}, {:.2}, {:.2})m",
+            best.time,
+            best.confidence,
+            best.rms_px,
+            best.position[0],
+            best.position[1],
+            best.position[2]
         );
     }
     report.write_json(dest)?;

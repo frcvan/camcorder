@@ -109,7 +109,9 @@ impl SplitMode {
             "both" => Ok(SplitMode::Both),
             "tiled" => Ok(SplitMode::Tiled),
             "scenes" => Ok(SplitMode::Scenes),
-            other => bail!("unknown video.mode {other:?}; expected \"both\", \"tiled\" or \"scenes\""),
+            other => {
+                bail!("unknown video.mode {other:?}; expected \"both\", \"tiled\" or \"scenes\"")
+            }
         }
     }
 
@@ -153,9 +155,9 @@ impl Layout {
         if value == "auto" {
             return Ok(Layout::Auto);
         }
-        Grid::parse(&value)
-            .map(Layout::Grid)
-            .with_context(|| format!("unknown video.layout {value:?}; expected \"auto\" or e.g. \"2x2\""))
+        Grid::parse(&value).map(Layout::Grid).with_context(|| {
+            format!("unknown video.layout {value:?}; expected \"auto\" or e.g. \"2x2\"")
+        })
     }
 }
 
@@ -194,8 +196,8 @@ impl CamcorderConfig {
                 DEFAULT_CONFIG_FILE
             )
         })?;
-        let config: CamcorderConfig = toml::from_str(&text)
-            .with_context(|| format!("parsing config {}", path.display()))?;
+        let config: CamcorderConfig =
+            toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
         config.validate()?;
         Ok(config)
     }
@@ -309,7 +311,11 @@ preset = "fast"
     fn default_output_dir_is_a_temp_dir() {
         let dir = default_output_dir();
         assert!(dir.is_absolute(), "got {}", dir.display());
-        assert!(dir.starts_with(std::env::temp_dir()), "got {}", dir.display());
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "got {}",
+            dir.display()
+        );
     }
 
     #[test]
@@ -342,14 +348,20 @@ preset = "fast"
             "team = 254\nyear = 2025\n[video]\nmode = \"split\"\n",
         )
         .expect_err("bad mode is rejected");
-        assert!(error.to_string().contains("unknown video.mode"), "got: {error}");
+        assert!(
+            error.to_string().contains("unknown video.mode"),
+            "got: {error}"
+        );
     }
 
     #[test]
     fn layout_accepts_auto_and_grids() {
         assert_eq!(Layout::parse("auto").unwrap(), Layout::Auto);
         assert_eq!(Layout::parse("1x1").unwrap(), Layout::Grid(Grid::SINGLE));
-        assert_eq!(Layout::parse(" 2X2 ").unwrap(), Layout::Grid(Grid::new(2, 2).unwrap()));
+        assert_eq!(
+            Layout::parse(" 2X2 ").unwrap(),
+            Layout::Grid(Grid::new(2, 2).unwrap())
+        );
         assert!(Layout::parse("two").is_err());
     }
 
