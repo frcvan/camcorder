@@ -2,3 +2,4 @@
 /output
 *.env*
 !.env.example
+__pycache__/

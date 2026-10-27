@@ -161,6 +161,34 @@ video was shot on. `--fov` is the source camera's horizontal field of view
 distance — a pose can be self-consistent, with sub-pixel reprojection error,
 and still be 20% too far away. `--tag-size` is 6.5 in for FRC tags.
 
+### Looking at the result in Rerun
+
+`scripts/rerun_poses.py` loads pose reports into [Rerun](https://rerun.io): the
+field and its tags, each camera as a frustum with the frame it saw, its path,
+and plots of position, height, heading, pitch, roll and reprojection error over
+the timeline.
+
+A report is one video, which can hold more than one camera — a tiled broadcast
+frame has an overview and two sub-views, and tags from different panes give
+poses metres apart. Poses closer than `--station-tolerance` (1.5 m) are treated
+as one fixed camera, and anything further is logged as its own station,
+`world/cameras/<name>/cam1`, `cam2`, …, so each one stands still instead of
+jumping. Frames whose camera lands below `--min-height` (0.5 m) are dropped with
+a note: those are the mirror solution a single tag allows, and no camera was
+ever there.
+
+```sh
+pip install rerun-sdk
+python scripts/rerun_poses.py $TMPDIR/camcorder/poses --spawn
+python scripts/rerun_poses.py poses/*.json --rrd field.rrd      # write a file
+```
+
+It reads the report's `tag_layout` from `assets/tags/`, so tags line up with
+what the solver used; `--layout-dir` and `--tag-size` cover a layout kept
+elsewhere. `--no-video` leaves the frames out (much smaller and faster;
+decoding frames is what takes the time), `--max-frames` caps how many come
+from each.
+
 One tag is enough for a pose but not enough to lean on: it fixes the direction
 the camera looks far better than how far away it is, so a single far tag and a
 wrong `--fov` can be metres out while reporting a sub-pixel fit. Frames with two
