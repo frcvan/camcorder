@@ -34,6 +34,35 @@ pub struct Solution {
     pub tags: Vec<u16>,
 }
 
+/// One frame's solve, together with the rival poses the same corners admit.
+///
+/// A lone square tag has two poses that reproject its corners to the same
+/// pixels, and with real corner noise the fit cannot say which is the camera:
+/// on the pane that prompted this, the reported pose and its rival fitted the
+/// same corners 0.42px and 0.46px, nine metres apart on the field, and two of
+/// its frames fitted both answers to the same 0.29px. The rival is carried out
+/// rather than discarded so something that *can* tell them apart — the ink
+/// printed inside the tag's border, or the structure the tag is bolted to — has
+/// a chance to, and so that a report can say the question was open when nothing
+/// could.
+#[derive(Debug, Clone)]
+pub struct Candidates {
+    pub chosen: Solution,
+    /// Other plausible cameras that fit the corners about as well, metres from
+    /// the winner. Empty when several tags pinned one pose between them.
+    pub rivals: Vec<Solution>,
+}
+
+/// How far a rival has to be from the winning pose to count as a different
+/// place rather than the same fit with different noise in it. A metre: the
+/// ambiguity this exists for puts the camera on the far side of the field, and
+/// two answers within a metre of each other are one answer.
+const RIVAL_MIN_SEPARATION_M: f64 = 1.0;
+
+/// Rivals carried out at most. The ambiguity a square leaves is one pose; more
+/// than two near-ties is not a branch question but a broken frame.
+const MAX_RIVALS: usize = 2;
+
 /// A 3D point on a tag and where it was seen.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Correspondence {
@@ -49,7 +78,9 @@ pub fn solve(
     tag_size: f64,
     camera: &Intrinsics,
 ) -> Option<Solution> {
-    solve_preferring(observations, layout, tag_size, camera, None).ok()
+    solve_all(observations, layout, tag_size, camera, None)
+        .ok()
+        .map(|candidates| candidates.chosen)
 }
 
 /// Solve the camera pose, preferring a particular end of the field.
@@ -65,6 +96,22 @@ pub fn solve_preferring(
     camera: &Intrinsics,
     prefer: Option<End>,
 ) -> Result<Solution, String> {
+    solve_all(observations, layout, tag_size, camera, prefer).map(|candidates| candidates.chosen)
+}
+
+/// Solve the camera pose, and keep the rivals the corners cannot rule out.
+///
+/// Same ordering and same gates as [`solve_preferring`]; the difference is that
+/// the poses that lost by a hair are handed back instead of dropped, because
+/// losing the fit is not the same as being wrong — the fit is the one thing a
+/// single square cannot use to choose between them.
+pub fn solve_all(
+    observations: &[TagObservation],
+    layout: &TagLayout,
+    tag_size: f64,
+    camera: &Intrinsics,
+    prefer: Option<End>,
+) -> Result<Candidates, String> {
     let corners = correspondences(observations, layout, tag_size);
     if corners.len() < 4 {
         return Err("no tag in the frame is in the layout".to_string());
@@ -204,12 +251,13 @@ fn matches_preference(pose: &CameraPose, layout: &TagLayout, prefer: Option<End>
     end_of_x(pose.position.x, layout.field_length) == prefer
 }
 
-/// The best pose in the pool, or the reason there is none.
+/// The best pose in the pool, and the near-ties it beat, or the reason there is
+/// none.
 fn choose(
     pool: Vec<(Solution, Vec<Correspondence>)>,
     layout: &TagLayout,
     prefer: Option<End>,
-) -> Result<Solution, String> {
+) -> Result<Candidates, String> {
     // The closest fit is the one whose rejection explains the frame best: if
     // the pose that fits the corners best is impossible, that is the story.
     let mut impossible: Option<(f64, String)> = None;
@@ -242,16 +290,53 @@ fn choose(
         .iter()
         .map(|(solution, _)| solution.rms_px)
         .fold(f64::INFINITY, f64::min);
-    let mut ranked = candidates.into_iter().filter(|(solution, _)| {
-        solution.rms_px.is_finite() && solution.rms_px <= best_rms * 1.5 + 0.5
-    });
-    let mut best = ranked.next().expect("at least the best fit qualifies");
-    for candidate in ranked {
-        if better(&candidate.0, &best.0, layout, prefer) {
-            best = candidate;
+    let mut ranked: Vec<(Solution, Vec<Correspondence>)> = candidates
+        .into_iter()
+        .filter(|(solution, _)| {
+            solution.rms_px.is_finite() && solution.rms_px <= best_rms * 1.5 + 0.5
+        })
+        .collect();
+    // Ordered by the fit before the tie-breaks are applied, so which pose wins
+    // a genuine tie is a property of the poses and not of the order the pool
+    // happened to be built in.
+    ranked.sort_by(|a, b| a.0.rms_px.total_cmp(&b.0.rms_px));
+    let mut winner = 0;
+    for index in 1..ranked.len() {
+        if better(&ranked[index].0, &ranked[winner].0, layout, prefer) {
+            winner = index;
         }
     }
-    Ok(best.0)
+    if super::debug_enabled() {
+        let listed: Vec<String> = ranked
+            .iter()
+            .map(|(solution, agreed)| {
+                let position = solution.pose.position;
+                format!(
+                    "({:.2}, {:.2}, {:.2})m rms {:.2}px on {} corner(s)",
+                    position.x,
+                    position.y,
+                    position.z,
+                    solution.rms_px,
+                    agreed.len()
+                )
+            })
+            .collect();
+        eprintln!(
+            "  [pool] {} in the tie band: {}",
+            ranked.len(),
+            listed.join(" | ")
+        );
+    }
+    let chosen = ranked.remove(winner).0;
+    let mut rivals: Vec<Solution> = ranked
+        .into_iter()
+        .map(|(solution, _)| solution)
+        .filter(|solution| {
+            (solution.pose.position - chosen.pose.position).norm() >= RIVAL_MIN_SEPARATION_M
+        })
+        .collect();
+    rivals.truncate(MAX_RIVALS);
+    Ok(Candidates { chosen, rivals })
 }
 
 /// Whether `a` should be preferred to `b`: colour agreement first, then how

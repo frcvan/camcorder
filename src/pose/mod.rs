@@ -10,6 +10,8 @@
 //! - [`detect`]: finding tag corners in a frame.
 //! - [`corners`]: putting those corners where the borders actually cross.
 //! - [`solve`]: turning corners into a camera pose.
+//! - [`verify`]: whether the picture backs a pose up, beyond the corners it was
+//!   fitted to.
 //! - [`trust`]: which detections and which poses deserve to be believed.
 //! - [`station`]: what is only knowable across frames — the lens, and where the
 //!   camera stood.
@@ -40,14 +42,16 @@ pub mod solve;
 pub mod station;
 pub mod trust;
 pub mod types;
+mod verify;
 
 use std::{collections::HashMap, path::Path};
 
 use anyhow::{bail, Result};
 
 pub use detect::TagDetector;
+pub use detect::TagPatterns;
 pub use layout::{TagLayout, TagPose};
-pub use report::{FramePose, MissedFrame, PoseReport, StationReport};
+pub use report::{FrameCheck, FramePose, MissedFrame, PoseReport, RivalPose, StationReport};
 pub use side::{Alliance, End, Pane, SideVerdict};
 pub use types::{CameraPose, Intrinsics, Quat, TagObservation, Vec3};
 
@@ -131,24 +135,42 @@ struct Judge<'a> {
     options: &'a PoseOptions,
     /// Whether `camera` came from a measurement rather than the `--fov` guess.
     calibrated: bool,
+    /// The printed patterns of FRC's tag family, for checking a pose against
+    /// the ink the tag is printed with rather than only its corners.
+    patterns: &'a TagPatterns,
 }
 
 /// What one pass over the frames produced.
 struct Evaluated {
     views: Vec<station::View>,
     frames: Vec<FramePose>,
+    /// What the picture made of the pose each frame turned down, in the same
+    /// order as `frames`. Kept out of the report because it is only ever a
+    /// sentence's worth of state: the numbers it stands for are in
+    /// [`FramePose::check`], and the sentence can be made again from them once
+    /// the joint fit has had its say about where the row's camera was.
+    rival_scores: Vec<Option<verify::Scores>>,
     missed: Vec<MissedFrame>,
 }
 
 impl Judge<'_> {
-    fn evaluate(&self, prepared: &[Prepared]) -> Evaluated {
+    /// Solve every frame, checking each answer against the picture itself.
+    ///
+    /// `pictures` are the decoded frames, in the same order and of the same
+    /// length as `prepared`: they are what the pattern and the mount structure
+    /// are read from, and what makes the difference between a pose that fits and
+    /// a pose the picture agrees with. A frame with no picture to check against
+    /// (which the run does not produce, and which is passed in rather than
+    /// assumed) is solved and reported unchecked.
+    fn evaluate(&self, prepared: &[Prepared], pictures: &[frames::Frame]) -> Evaluated {
         let mut evaluated = Evaluated {
             views: Vec::new(),
             frames: Vec::new(),
+            rival_scores: Vec::new(),
             missed: Vec::new(),
         };
 
-        for frame in prepared {
+        for (index, frame) in prepared.iter().enumerate() {
             if frame.detections.is_empty() {
                 evaluated.missed.push(MissedFrame {
                     time: frame.time,
@@ -162,14 +184,14 @@ impl Judge<'_> {
                 .iter()
                 .map(|detection| detection.id)
                 .collect();
-            let solution = match solve::solve_preferring(
+            let candidates = match solve::solve_all(
                 &frame.detections,
                 self.layout,
                 self.options.tag_size_m,
                 self.camera,
                 frame.prefer,
             ) {
-                Ok(solution) => solution,
+                Ok(candidates) => candidates,
                 Err(reason) => {
                     evaluated.missed.push(MissedFrame {
                         time: frame.time,
@@ -179,6 +201,29 @@ impl Judge<'_> {
                     continue;
                 }
             };
+            // The pose is what the corners say; the check is whether anything
+            // else in the picture agrees with it. Where a lone tag leaves two
+            // answers, this is also where the choice between them is made — by
+            // evidence the fit itself cannot use, because both answers fit.
+            let checked = match pictures.get(index) {
+                Some(picture_frame) => verify::Picture {
+                    frame: picture_frame,
+                    camera: self.camera,
+                    layout: self.layout,
+                    tag_size: self.options.tag_size_m,
+                    patterns: self.patterns,
+                    structure: model::describes(&self.layout.name),
+                }
+                .choose(candidates, &frame.detections),
+                None => verify::Checked {
+                    chosen: candidates.chosen,
+                    check: report::FrameCheck::uninspected(),
+                    rival_scores: None,
+                },
+            };
+            let check = checked.check;
+            let solution = checked.chosen;
+            let rival_scores = checked.rival_scores;
             if solution.rms_px > self.options.max_rms_px {
                 evaluated.missed.push(MissedFrame {
                     time: frame.time,
@@ -268,6 +313,7 @@ impl Judge<'_> {
                 tags: solution.tags.clone(),
                 lines: Vec::new(),
             });
+            evaluated.rival_scores.push(rival_scores);
             evaluated.frames.push(FramePose::new(report::FrameOutcome {
                 time: frame.time,
                 pose: &solution.pose,
@@ -281,6 +327,7 @@ impl Judge<'_> {
                     0.0
                 },
                 side: verdict,
+                check,
             }));
         }
         evaluated
@@ -324,6 +371,8 @@ pub fn estimate(video: &Path, options: &PoseOptions) -> Result<PoseReport> {
     }
 
     let layout = TagLayout::load(&options.tag_layout)?;
+    // Compiled into the binary, so this is the family's 587 patterns and no I/O.
+    let patterns = TagPatterns::new()?;
     let info = crate::video::probe(video)?;
     let times = frames::sample_times(info.duration, options.samples, options.window);
     if times.is_empty() {
@@ -411,8 +460,9 @@ pub fn estimate(video: &Path, options: &PoseOptions) -> Result<PoseReport> {
         support: &support,
         options,
         calibrated: false,
+        patterns: &patterns,
     };
-    let provisional = judge.evaluate(&prepared);
+    let provisional = judge.evaluate(&prepared, &sampled);
     let calibration = station::calibrate(&provisional.views, assumed);
 
     let calibrated;
@@ -424,8 +474,9 @@ pub fn estimate(video: &Path, options: &PoseOptions) -> Result<PoseReport> {
             support: &support,
             options,
             calibrated: true,
+            patterns: &patterns,
         };
-        calibrated.evaluate(&prepared)
+        calibrated.evaluate(&prepared, &sampled)
     } else {
         provisional
     };
@@ -537,6 +588,35 @@ pub fn estimate(video: &Path, options: &PoseOptions) -> Result<PoseReport> {
             };
             row.adopt(pose);
             row.rms_px = solve::reprojection_rms(pose, &view.corners, frame_camera);
+            // The check was made against the pose the frame solved for itself.
+            // The row now carries the fitted camera, so the check is made again
+            // against that: a check of a pose the report no longer holds would
+            // be a number about nothing. The rival stays — it is a fact about
+            // the frame's corners, not about the pose the row ended up with.
+            if let (Some(picture_frame), Some(observed)) = (
+                sampled.iter().find(|sample| sample.time == row.time),
+                prepared.iter().find(|entry| entry.time == row.time),
+            ) {
+                let picture = verify::Picture {
+                    frame: picture_frame,
+                    camera: frame_camera,
+                    layout: &layout,
+                    tag_size: options.tag_size_m,
+                    patterns: &patterns,
+                    structure: model::describes(&layout.name),
+                };
+                let scores = picture.scores(pose, &row.tags, &observed.detections);
+                verify::apply(&mut row.check, scores);
+                // The reason a rival was turned down quotes the reading of the
+                // pose that was reported, so it is made again now the row
+                // carries the fitted camera: half a comparison, left over from
+                // a pose the report no longer holds, is worse than no sentence.
+                if let Some(Some(rival)) = evaluated.rival_scores.get(index) {
+                    if let Some(entry) = row.check.rival.as_mut() {
+                        entry.rejected = verify::rejection(rival, &scores);
+                    }
+                }
+            }
             if let Some(entry) = prepared
                 .iter()
                 .find(|entry| entry.time == row.time)

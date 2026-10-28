@@ -363,6 +363,20 @@ fn a_solved_pose_lands_where_the_camera_was() {
             "a single-tag frame should read as weak evidence, got {}",
             frame.confidence
         );
+
+        // And the pose is checked against the picture it came from: the fixture
+        // draws the tag cell by cell, so reading its code back is a reading of
+        // the whole pipeline — decoder, corner fit, solve and check — and it is
+        // the only thing that can tell the two poses a lone square admits apart.
+        let agreement = frame
+            .check
+            .pattern_agreement
+            .expect("a tag this size has a readable printed code");
+        assert!(
+            agreement > 0.85,
+            "the tag's own pattern should confirm the pose it was solved from, got {:.0}%",
+            agreement * 100.0
+        );
         assert!(
             frame.weakest_margin > 30.0,
             "margin {}",

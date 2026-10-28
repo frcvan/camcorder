@@ -20,11 +20,13 @@
 //! re-matches as its fit improves for exactly that reason.
 
 use serde::Deserialize;
+use std::sync::OnceLock;
 
 use super::{
     frames::Frame,
+    layout::TagLayout,
     solve::LineObservation,
-    types::{CameraPose, Intrinsics, Vec3},
+    types::{CameraPose, Intrinsics, Mat3, Vec3},
 };
 
 #[derive(Deserialize)]
@@ -36,9 +38,9 @@ struct Marking {
 
 /// One tag's mounting structure, as a box outline in field coordinates.
 #[derive(Deserialize)]
-struct StructureTag {
-    id: u16,
-    segments: Vec<[[f64; 3]; 2]>,
+pub(crate) struct StructureTag {
+    pub(crate) id: u16,
+    pub(crate) segments: Vec<[[f64; 3]; 2]>,
 }
 
 /// How far from a projected model edge the image edge is looked for on the first
@@ -60,6 +62,30 @@ const EDGE_SUPPORT_FRACTION: f64 = 0.4;
 /// Most model observations taken from one frame, so a single busy picture
 /// cannot outweigh the rest of the run.
 const MAX_LINES_PER_FRAME: usize = 60;
+
+/// The bundled structure, parsed once.
+///
+/// It is compiled into the binary and never changes, so parsing it per frame —
+/// and it is read once per frame per model round — is pure waste, and the waste
+/// grows with the length of the file.
+pub(crate) fn bundled_structure() -> &'static [StructureTag] {
+    static STRUCTURE: OnceLock<Vec<StructureTag>> = OnceLock::new();
+    STRUCTURE.get_or_init(|| {
+        serde_json::from_str(include_str!(
+            "../../assets/field/2026-rebuilt-advantagescope/structure.json"
+        ))
+        .unwrap_or_default()
+    })
+}
+
+/// Whether the bundled structure describes this layout.
+///
+/// `structure.json` is converted from the 2026 field's own mesh. Matching it
+/// against another season's field would be looking for this season's hardware on
+/// last season's carpet, and finding nothing would say nothing about the pose.
+pub(crate) fn describes(layout_name: &str) -> bool {
+    layout_name == "2026-rebuilt-welded"
+}
 
 /// Every image-to-model line observation in one frame: the alliance tape, which
 /// the colour identifies on its own, and the outline of whatever structure the
@@ -199,13 +225,9 @@ fn structure_lines(
     if tags.is_empty() {
         return Vec::new();
     }
-    let Ok(structure) = serde_json::from_str::<Vec<StructureTag>>(include_str!(
-        "../../assets/field/2026-rebuilt-advantagescope/structure.json"
-    )) else {
-        return Vec::new();
-    };
+    let structure = bundled_structure();
     let mut result = Vec::new();
-    for entry in &structure {
+    for entry in structure {
         if !tags.contains(&entry.id) {
             continue;
         }
@@ -218,6 +240,74 @@ fn structure_lines(
     result
 }
 
+/// How far off a tag's own plane a piece of its mount has to be before what the
+/// picture shows of it says anything about *which* pose the camera is in.
+///
+/// The ambiguity a flat tag leaves maps the tag's plane onto itself, so anything
+/// lying in that plane — the tag, its backing plate, the tape behind it — lands
+/// on the same pixels for both answers and can say nothing about which is right.
+/// Only the parts that are off the plane move, and this is how far off they have
+/// to be to move by more than the search window: at six metres and 800 pixels of
+/// focal, eight pixels is six centimetres, and this floor is more than twice
+/// that, so no qualifying sample can be explained by the ambiguity at all.
+const MIN_OFF_PLANE_M: f64 = 0.15;
+
+/// How much of the structure the given tags stand on the picture actually backs
+/// up, as `(supported, considered)` model-edge samples.
+///
+/// This is the same evidence [`structure_lines`] matches, counted instead of
+/// kept. It answers a different question: not "what can be added to the fit"
+/// but "which of two poses does the picture support" — and that question the
+/// field model can answer, because a pose can be projected from and scored
+/// without anything in the picture having to be identified first. A pose that
+/// puts a tag's mount where the carpet is scores near zero however well it
+/// reprojects the tag itself.
+///
+/// Only samples *off the tag's own plane* are counted, at both ends of the
+/// ratio. They are the only ones the ambiguity does not place identically for
+/// both answers, so counting the rest would score two poses the same and hide
+/// the difference in noise. `considered` is also restricted to samples in front
+/// of the camera and inside the picture, so a pose that puts the structure off
+/// the edge of the frame is not flattered by it.
+pub(crate) fn structure_support(
+    frame: &Frame,
+    pose: &CameraPose,
+    camera: &Intrinsics,
+    tags: &[u16],
+    layout: &TagLayout,
+    search_px: f64,
+) -> Option<(usize, usize)> {
+    if tags.is_empty() {
+        return None;
+    }
+    let (mut supported, mut considered) = (0usize, 0usize);
+    for entry in bundled_structure() {
+        if !tags.contains(&entry.id) {
+            continue;
+        }
+        let Some(tag) = layout.tag(entry.id) else {
+            continue;
+        };
+        let normal = Mat3::from_quaternion(tag.rotation).mul_vec(Vec3::new(1.0, 0.0, 0.0));
+        let off_plane =
+            |point: Vec3| ((point - tag.translation).dot(normal)).abs() >= MIN_OFF_PLANE_M;
+        for segment in &entry.segments {
+            let (hit, seen) = segment_support(frame, pose, camera, segment, search_px, &off_plane);
+            supported += hit;
+            considered += seen;
+        }
+    }
+    if considered == 0 {
+        None
+    } else {
+        Some((supported, considered))
+    }
+}
+
+/// Where a model edge was found in the picture, and where it was looked for:
+/// `(found, considered)`.
+type EdgeSamples = (Vec<(f64, f64)>, Vec<(f64, f64)>);
+
 /// One model edge's image samples, or nothing when the picture has no edge there.
 fn match_segment(
     frame: &Frame,
@@ -228,21 +318,76 @@ fn match_segment(
 ) -> Option<Vec<LineObservation>> {
     let start = Vec3::from_array(segment[0]);
     let end = Vec3::from_array(segment[1]);
+    let (found, _) = sample_segment(frame, pose, camera, segment, search_px, &|_| true);
+    if found.len() * 2 < (EDGE_SAMPLES as f64 * EDGE_SUPPORT_FRACTION) as usize {
+        return None;
+    }
+    let step = found.len().div_ceil(EDGE_KEEP).max(1);
+    Some(
+        found
+            .into_iter()
+            .step_by(step)
+            .take(EDGE_KEEP)
+            .map(|(x, y)| LineObservation {
+                start,
+                end,
+                image: (x, y),
+            })
+            .collect(),
+    )
+}
+
+/// Model-edge samples with an image edge under them, and how many were looked
+/// for, for one model edge, counting only points `keep` accepts.
+fn segment_support(
+    frame: &Frame,
+    pose: &CameraPose,
+    camera: &Intrinsics,
+    segment: &[[f64; 3]; 2],
+    search_px: f64,
+    keep: &dyn Fn(Vec3) -> bool,
+) -> (usize, usize) {
+    let (supported, considered) = sample_segment(frame, pose, camera, segment, search_px, keep);
+    (supported.len(), considered.len())
+}
+
+/// The image points where the picture has an edge under this model edge, and the
+/// points that were looked for and answered for.
+///
+/// `keep` is applied to the *field* point of each sample, so a caller can leave
+/// out samples that say nothing about the question it is asking — the fit wants
+/// every edge of the mount, a check between two poses wants only the edges the
+/// ambiguity cannot place for both of them.
+fn sample_segment(
+    frame: &Frame,
+    pose: &CameraPose,
+    camera: &Intrinsics,
+    segment: &[[f64; 3]; 2],
+    search_px: f64,
+    keep: &dyn Fn(Vec3) -> bool,
+) -> EdgeSamples {
+    let start = Vec3::from_array(segment[0]);
+    let end = Vec3::from_array(segment[1]);
     let mut projected = Vec::new();
     for index in 0..=EDGE_SAMPLES {
         let t = index as f64 / EDGE_SAMPLES as f64;
         let point = start + (end - start) * t;
-        projected.push(
+        let kept = keep(point);
+        projected.push(kept.then(|| {
             camera
                 .project(pose.to_camera(point))
-                .map(|(u, v)| (u, v, t)),
-        );
+                .map(|(u, v)| (u, v, t))
+        }));
     }
-    let mut supported = Vec::new();
+    let mut found = Vec::new();
+    let mut looked = Vec::new();
     for index in 1..EDGE_SAMPLES {
         let (Some(previous), Some(current), Some(next)) =
             (projected[index - 1], projected[index], projected[index + 1])
         else {
+            continue;
+        };
+        let (Some(previous), Some(current), Some(next)) = (previous, current, next) else {
             continue;
         };
         // The edge has to run somewhere: the local tangent of the projection.
@@ -253,6 +398,7 @@ fn match_segment(
             continue;
         }
         let (nx, ny) = (-dy / length, dx / length);
+        looked.push((current.0, current.1));
         // Seek along the normal for the strongest gradient: a pose slightly off
         // still finds the edge, and the offset is what pulls it back.
         let mut best = None;
@@ -269,26 +415,11 @@ fn match_segment(
         }
         if let Some((magnitude, offset)) = best {
             if magnitude >= MIN_EDGE_GRADIENT {
-                supported.push((current.0 + nx * offset, current.1 + ny * offset, offset));
+                found.push((current.0 + nx * offset, current.1 + ny * offset));
             }
         }
     }
-    if supported.len() * 2 < (EDGE_SAMPLES as f64 * EDGE_SUPPORT_FRACTION) as usize {
-        return None;
-    }
-    let step = supported.len().div_ceil(EDGE_KEEP).max(1);
-    Some(
-        supported
-            .into_iter()
-            .step_by(step)
-            .take(EDGE_KEEP)
-            .map(|(x, y, _)| LineObservation {
-                start,
-                end,
-                image: (x, y),
-            })
-            .collect(),
-    )
+    (found, looked)
 }
 
 /// Luma change per pixel along `(nx, ny)` at a point, bilinearly sampled.
@@ -298,7 +429,12 @@ fn perpendicular_gradient(frame: &Frame, x: f64, y: f64, nx: f64, ny: f64) -> Op
     Some((after - before).abs() * 0.5)
 }
 
-fn sample_luma(frame: &Frame, x: f64, y: f64) -> Option<f64> {
+/// Luma at a fractional pixel, bilinearly, or `None` outside the picture.
+///
+/// Public to the subsystem because the tag's own printed cells are sampled with
+/// it: whatever a model edge is compared against and what a pattern is read from
+/// should be the same pixels, read the same way.
+pub(crate) fn sample_luma(frame: &Frame, x: f64, y: f64) -> Option<f64> {
     let width = frame.width as usize;
     let height = frame.height as usize;
     if x < 0.0 || y < 0.0 || x >= (width - 1) as f64 || y >= (height - 1) as f64 {
@@ -328,7 +464,6 @@ mod tests {
         ))
         .expect("the bundled structure parses")
     }
-
     /// A frame with `segment` drawn on it as a dark-to-light edge.
     fn frame_with_edge(camera: &Intrinsics, line: &[[f64; 3]; 2]) -> (Frame, CameraPose) {
         let start = Vec3::from_array(line[0]);

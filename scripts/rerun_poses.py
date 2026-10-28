@@ -608,6 +608,57 @@ def log_station(camera: Camera) -> None:
     )
 
 
+def log_rivals(camera: Camera) -> list[str]:
+    """Where else the same corners say the camera could have been.
+
+    A lone square tag admits a second camera metres away — the fit cannot choose
+    between them, because a square is the same square turned half round — and the
+    report carries the loser instead of dropping it. Drawn beside the cameras it
+    belongs to, one marker per distinct place, so that "this pose does not match
+    the model" can be looked at rather than argued about: the reported pose and
+    the pose the footage actually supports are usually at opposite corners of the
+    field. The reason the report gives is the marker's label.
+    """
+    places: dict[tuple[float, float, float], list] = {}
+    for frame in camera.solved:
+        rival = (frame.get("check") or {}).get("rival")
+        if not rival:
+            continue
+        # Half a metre is a place, not a pose: the frames that share an answer
+        # differ from each other by their corner noise.
+        position = [float(value) for value in rival["position"]]
+        key: tuple[float, float, float] = (
+            round(position[0] * 2) / 2,
+            round(position[1] * 2) / 2,
+            round(position[2] * 2) / 2,
+        )
+        if key not in places:
+            places[key] = [key, str(rival["rejected"]), 0]
+        places[key][2] += 1
+    if not places:
+        return []
+
+    ordered = sorted(places.values(), key=lambda place: -place[2])
+    rr.log(
+        f"world/rivals/{camera.name}",
+        rr.Points3D(
+            [list(place[0]) for place in ordered],
+            colors=[(255, 120, 120)],
+            radii=0.09,
+            labels=[
+                f"{camera.name}: also fits {place[2]} frame(s) from "
+                f"({place[0][0]:.1f}, {place[0][1]:.1f}, {place[0][2]:.1f})m — {place[1]}"
+                for place in ordered
+            ],
+        ),
+        static=True,
+    )
+    return [
+        f"({place[0][0]:.1f}, {place[0][1]:.1f}, {place[0][2]:.1f})m for {place[2]} frame(s)"
+        for place in ordered
+    ]
+
+
 def usable(frame: dict, min_height: float | None) -> bool:
     """Whether a frame's pose is physically possible.
 
@@ -664,6 +715,8 @@ def log_pose(
     clusters = cluster_frames(kept, station_tolerance, STATION_ANGLE_TOLERANCE_DEG)
     log_trajectory(camera.name, clusters)
     log_station(camera)
+    for place in log_rivals(camera):
+        print(f"  {camera.name}: a second pose fits from {place}", file=sys.stderr)
 
     # A single station is just the camera; several get a name each, since they
     # are different cameras that happened to be measured in one file.

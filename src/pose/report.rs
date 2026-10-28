@@ -27,6 +27,136 @@ pub struct FrameOutcome<'a> {
     /// The least confident detection the solve used, in the decoder's margin.
     pub weakest_margin: f32,
     pub side: Option<SideVerdict>,
+    /// What the picture says about the pose beyond the corners it was fitted
+    /// to, and the rival pose a lone tag leaves open.
+    pub check: FrameCheck,
+}
+
+/// What the picture says about a pose *beyond* the corners it was fitted to.
+///
+/// A pose is fitted to a tag's four outer corners, and those four points are the
+/// corners of a square — and a square is the same square mirrored, and the same
+/// square turned half round. So the corners alone admit a second pose that
+/// reprojects them to the same pixels, metres away on the field, and no amount
+/// of corner precision separates the two. Two things in the picture are not
+/// symmetric, and are what this reports:
+///
+/// * the code printed *inside* the border, which the decode already read;
+/// * the structure the tag is bolted to, from the field model's own geometry,
+///   which is not in the tag's plane and so is not scaled by whatever focal
+///   length the tag was solved with.
+///
+/// Both are fractions, and both are `None` when there was nothing readable: a
+/// tag too small for its cells, or a layout the bundled model does not describe.
+#[derive(Debug, Clone, Serialize)]
+pub struct FrameCheck {
+    /// Fraction of the printed cells whose ink lands where this pose predicts,
+    /// `0..1`. Chance is 0.5: the reading's own threshold is set by the samples.
+    pub pattern_agreement: Option<f64>,
+    /// Luma levels between the cells this pose predicts are light and the ones
+    /// it predicts are dark. Negative is the tag being read inside out.
+    pub pattern_contrast: Option<f64>,
+    /// Cells the pattern reading was based on.
+    pub pattern_cells: usize,
+    /// Fraction of the mount the decoded tags stand on whose model edges have a
+    /// real image edge under them, `0..1`. Low is weak evidence, not proof —
+    /// the mount is at carpet level and a robot may be standing on it.
+    pub structure_support: Option<f64>,
+    /// The other pose these same corners admit, when there was one.
+    pub rival: Option<RivalPose>,
+}
+
+impl FrameCheck {
+    /// A check with nothing in it: no picture to read, or nothing readable.
+    pub fn uninspected() -> Self {
+        FrameCheck {
+            pattern_agreement: None,
+            pattern_contrast: None,
+            pattern_cells: 0,
+            structure_support: None,
+            rival: None,
+        }
+    }
+
+    /// Whether the picture fails to back the pose up.
+    ///
+    /// Only said of a reading that could be made: a tag too small to read its
+    /// pattern is not a pose the picture disagrees with, it is a pose the
+    /// picture has no opinion about — no reading, no flag.
+    ///
+    /// The two numbers sit well below what a pose that is really there reads,
+    /// rather than at the best a wrong one is known to do. On the fixture in
+    /// [`super::verify`], the pose the picture was drawn from reads its own
+    /// pattern above 85% of the cells and its mount above 80%, and the wrong
+    /// answer to the same corners a good deal less, but the flag is not a
+    /// decision and must not be read as one: it says the footage contradicts
+    /// this pose, which is worth saying even when the mount is behind a robot.
+    pub fn unbacked(&self) -> bool {
+        self.pattern_agreement.is_some_and(|value| value < 0.7)
+            || self.structure_support.is_some_and(|value| value < 0.25)
+    }
+
+    /// One line for the table when there is something to say, otherwise `None`.
+    ///
+    /// Two things are worth a line: a rival pose the fit could not choose
+    /// between, which is what the reader needs to know to distrust a single
+    /// tag, and a pose the picture does not back at all.
+    pub fn describe(&self) -> Option<String> {
+        let mut said = Vec::new();
+        if let Some(rival) = &self.rival {
+            said.push(format!(
+                "another pose fits these corners as well, from ({:.2}, {:.2}, {:.2})m: {}",
+                rival.position[0], rival.position[1], rival.position[2], rival.rejected
+            ));
+        }
+        if self.unbacked() {
+            let mut parts = Vec::new();
+            if let Some(agreement) = self.pattern_agreement {
+                if agreement < 0.7 {
+                    parts.push(format!(
+                        "the tag's own printed pattern reads {:.0}%",
+                        agreement * 100.0
+                    ));
+                }
+            }
+            if let Some(support) = self.structure_support {
+                if support < 0.25 {
+                    parts.push(format!(
+                        "only {:.0}% of the mount the tags stand on has an edge under it",
+                        support * 100.0
+                    ));
+                }
+            }
+            if !parts.is_empty() {
+                said.push(format!(
+                    "the picture does not back this pose: {}",
+                    parts.join(", ")
+                ));
+            }
+        }
+        if said.is_empty() {
+            None
+        } else {
+            Some(said.join("; "))
+        }
+    }
+}
+
+/// The camera could have been here instead.
+///
+/// A lone square tag leaves exactly this: a second pose that puts the tag's
+/// corners on the same pixels. It is reported, never hidden, because a fit that
+/// cannot choose between two places is a fact about the footage.
+#[derive(Debug, Clone, Serialize)]
+pub struct RivalPose {
+    pub position: [f64; 3],
+    pub rotation: [f64; 4],
+    pub rms_px: f64,
+    /// What the picture made of this pose, on the same terms as the reported one.
+    pub pattern_agreement: Option<f64>,
+    pub structure_support: Option<f64>,
+    /// Why it is not the pose that was reported, in words.
+    pub rejected: String,
 }
 
 /// The camera's pose at one sampled frame.
@@ -62,6 +192,9 @@ pub struct FramePose {
     /// `None` when the file is the overview pane, which holds both alliances
     /// and so cannot answer the question.
     pub side: Option<SideVerdict>,
+    /// What the picture makes of this pose beyond the fit, and the rival pose
+    /// the fit could not rule out.
+    pub check: FrameCheck,
 }
 
 impl FramePose {
@@ -81,6 +214,7 @@ impl FramePose {
             pitch_deg: pose.pitch_deg(),
             roll_deg: pose.roll_deg(),
             side: outcome.side,
+            check: outcome.check,
         }
     }
 
@@ -327,6 +461,30 @@ impl PoseReport {
                     let _ = writeln!(out, "  {:5.1}s: {disagreement}", frame.time);
                 }
             }
+            // What the picture made of the poses, when it had something to say
+            // that the numbers above do not: a lone tag leaves two answers, and
+            // a pose nothing in the picture backs is worth flagging.
+            let mut said = 0usize;
+            for frame in &self.solved {
+                if let Some(note) = frame.check.describe() {
+                    let _ = writeln!(out, "  {:5.1}s: {note}", frame.time);
+                    said += 1;
+                }
+            }
+            if said == 0 && !self.solved.is_empty() {
+                let readable = self
+                    .solved
+                    .iter()
+                    .filter(|frame| frame.check.pattern_agreement.is_some())
+                    .count();
+                if readable > 0 {
+                    let _ = writeln!(
+                        out,
+                        "  every pose is backed by the picture: the tags' own patterns were read in {readable} of {} frame(s)",
+                        self.solved.len()
+                    );
+                }
+            }
         }
         if let Some(ptz) = &self.ptz_station {
             let _ = writeln!(out, "  {}", ptz.describe());
@@ -376,4 +534,78 @@ fn pitch_deg(rotation: &[f64; 4]) -> f64 {
         rotation: super::types::Quat::new(rotation[0], rotation[1], rotation[2], rotation[3]),
     };
     pose.pitch_deg()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(pattern: Option<f64>, structure: Option<f64>) -> FrameCheck {
+        FrameCheck {
+            pattern_agreement: pattern,
+            pattern_contrast: pattern.map(|_| 90.0),
+            pattern_cells: if pattern.is_some() { 36 } else { 0 },
+            structure_support: structure,
+            rival: None,
+        }
+    }
+
+    #[test]
+    fn a_pose_the_picture_contradicts_is_flagged_and_a_quiet_one_is_not() {
+        // The report is the thing a person reads, so what it says about a pose
+        // is worth a test of its own. A pose the footage contradicts has to be
+        // flagged in words — that is the whole point of reading the picture a
+        // second way — while a pose it backs must produce no line at all: a
+        // report that talks about every frame says nothing about any of them.
+        assert!(
+            check(None, None).describe().is_none(),
+            "a frame with no reading has nothing to say"
+        );
+        assert!(
+            check(Some(0.89), Some(0.83)).describe().is_none(),
+            "what the fixture's right answer reads is not a flag"
+        );
+
+        let pattern = check(Some(0.5), None)
+            .describe()
+            .expect("a pattern reading below chance-plus is a flag");
+        assert!(
+            pattern.contains("does not back this pose") && pattern.contains("50%"),
+            "got {pattern:?}"
+        );
+
+        let mount = check(None, Some(0.1))
+            .describe()
+            .expect("a mount with no edge under it is a flag");
+        assert!(
+            mount.contains("10% of the mount"),
+            "the flag has to say which reading it came from, got {mount:?}"
+        );
+    }
+
+    #[test]
+    fn the_rival_pose_is_reported_with_the_reason_it_lost() {
+        // A lone square tag leaves a second camera metres away, and that is the
+        // fact a reader needs to distrust a single-tag frame. It is said in the
+        // table next to the pose that was reported, with the reason the picture
+        // turned it down.
+        let mut frame = check(Some(0.9), Some(0.85));
+        frame.rival = Some(RivalPose {
+            position: [8.89, -0.34, 2.05],
+            rotation: [1.0, 0.0, 0.0, 0.0],
+            rms_px: 0.46,
+            pattern_agreement: None,
+            structure_support: Some(0.63),
+            rejected: "63% of the mount has an edge under it here".to_string(),
+        });
+        let note = frame.describe().expect("the rival is worth a line");
+        assert!(
+            note.contains("(8.89, -0.34, 2.05)m") && note.contains("63% of the mount"),
+            "the note has to place the other camera and give the reason, got {note:?}"
+        );
+        assert!(
+            !note.contains("does not back this pose"),
+            "the reported pose is backed here, so it must not be flagged, got {note:?}"
+        );
+    }
 }

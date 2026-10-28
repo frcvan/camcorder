@@ -9,7 +9,7 @@ camera was from the AprilTags in the picture.
 | what | command |
 | --- | --- |
 | build | `cargo build --release` |
-| test everything | `cargo test` (102 tests: 88 unit, 3 CLI, 5 pose pipeline, 6 video pipeline) |
+| test everything | `cargo test` (127 tests: 112 unit, 3 CLI, 5 pose pipeline, 7 video pipeline) |
 | one area | `cargo test --lib pose` / `cargo test --test views_pipeline` |
 | lint | `cargo clippy --all-targets` |
 | format | `rustfmt --edition 2021 <files you touched>` |
@@ -39,13 +39,13 @@ src/video.rs     ffmpeg: probe, scene cuts, divider detection, cropping
 src/pose/        camera pose from AprilTags — self-contained subsystem
   types.rs       Vec3/Mat3/Quat/Intrinsics/CameraPose, no dependencies
   layout.rs      WPILib field layouts and tag corners
-  model.rs       image-to-model observations from the field asset
   model.rs       image-to-model line observations, from the field asset
   frames.rs      RGB frame sampling (owns all ffmpeg use) and luma from it
   enhance.rs     contrast stretch + unsharp, before the decoder sees a frame
   detect.rs      36h11 detection (the only file that knows kornia)
   corners.rs     sub-pixel corners: the tag's borders fitted and intersected
   solve.rs       planar init, Levenberg-Marquardt refinement, branch choice
+  verify.rs      which of two admitted poses the picture backs, and why
   trust.rs       margin floors, tag-id voting, physical gates, confidence
   station.rs     focal length measured from the frames, one pose per station
   side.rs        alliance colour, field end, and the overview-pane rule
@@ -85,6 +85,39 @@ possible pose that fits within 1.5x of the best. What is left is honest: a
 single-tag frame scores ~0.5 confidence (0.7 once the lens is measured) against
 ~1 for three tags, and `--min-confidence` drops the weak ones on request.
 
+**A square's corners cannot choose between two cameras, so the printed code and
+the mount do.** The fit uses a tag's four *outer* corners, and those four points
+are the corners of a square — and a square is the same square turned half round.
+A lone tag therefore admits a second camera metres away: on the Orlando pane the
+solver's pool held two cameras 9 m apart that fitted the same corners at 0.42px
+and 0.46px (two frames fitted both answers to the same 0.29px), and the run
+reported the one that was never there. `solve_all` now carries the near-ties out
+instead of dropping them, and `verify` decides between them with two things the
+fit cannot use. The *code inside the border*, which the
+decode had already read, is not preserved by a half turn — and the *mount the tag
+is bolted to* is not on the tag's plane, so it lands somewhere else for each
+answer. Every solved frame carries both readings and the rival pose in its JSON;
+the table says which answer won and on what. Two floors keep it honest: a check
+that reads nothing (a mount behind a robot, a tag whose cells blur together)
+decides nothing, and the fit's own answer stands. `verify.rs`'s own tests are
+what hold this in place: a fixture whose twin fits *better* than the truth must
+still lose to the mount, a tag too small to read must leave the question open
+rather than pick, and the tag's cell grid read upside down must lose the frame.
+
+**On broadcast panes the tag's code is not readable, and the mount decides.**
+This one *was* measured, because it decides whether the code is used at all. The
+Orlando pane's tags are 15-18px wide, and with the reading's floor taken out of
+the way (`MIN_PATTERN_TAG_PX = 8` for one run) the two answers of the 28 frames
+that hold a rival read 69-100% of the cells each — both high, every frame — and
+the reading backed the pose the mount backs in only 20 of the 28. Two times in
+three is not a decision, so the reading is refused below 24px and the report says
+its pattern could not be read, leaving the mount to decide, which it does in 26
+of those 28 frames (reported 73-85%, rival 44-77%). Above the floor the code
+decides first and the mount second; in the fixture the right answer reads 89% of
+the cells against its twin's 56%. The mount check counts only samples more than 15cm off the tag's plane,
+because the parts of the mount that lie in that plane project to the same pixels
+for both answers and would only add a constant to the score.
+
 **The lens is measured, not assumed.** `--fov` is only a seed. Two tags a known
 distance apart fix the focal length from the picture itself, and a frame that
 fits better at some other focal length says so; the median across frames is used
@@ -100,6 +133,14 @@ panes the tags are 15–17 px wide, which leaves the scale genuinely uncertain:
 sweeping the focal from 400px to 1000px moves the camera 2–3 m with the
 reprojection flat at 0.25–0.35 px. Trust the direction and the side reading from
 that footage, not the metres.
+
+**The check is the model's own geometry, not a detector.** Nothing here
+recognises a trench or a ladder in the picture. The model knows where the mount
+of a tag it has *already decoded* is, projects it from a candidate pose, and asks
+whether the picture has an edge there — a comparison between two poses, which is
+a much smaller thing to ask of the field asset than identifying what is in a
+frame. `structure.json` is the 2026 field's mesh, so on any other layout there is
+nothing to check and `verify` says so instead of guessing.
 
 **The camera stood still, so fit the camera, not each frame.** `station::fit`
 fits one *pose* to every frame's corners, dropping frames that disagree (a pan,

@@ -105,6 +105,62 @@ class VideoTimelineTests(unittest.TestCase):
         # An explicit floor is still honoured, for anyone who wants one.
         self.assertFalse(poses.usable(low, 0.5))
 
+    def test_a_rival_pose_is_drawn_beside_the_camera_that_was_reported(self):
+        """A lone tag leaves a second camera, and the recording has to show it.
+
+        The fit cannot choose between the two — a square is the same square
+        turned half round — so the report carries the loser, and a viewer that
+        dropped it would show only the answer that happened to win. The two are
+        metres apart on the field, which is exactly why seeing both is worth
+        more than reading about it: the wrong one sits at the wrong end of the
+        trench, and the model behind it shows it.
+        """
+        camera = poses.Camera("clip", {
+            "frame_width": 160, "frame_height": 120, "horizontal_fov_deg": 60.0,
+            "solved": [
+                {
+                    "time": 1.0,
+                    "check": {
+                        "rival": {
+                            "position": [8.88, -0.34, 2.09],
+                            "rejected": "the mount is not there",
+                        }
+                    },
+                },
+                {
+                    "time": 2.0,
+                    "check": {
+                        "rival": {
+                            "position": [8.90, -0.35, 2.08],
+                            "rejected": "the mount is not there",
+                        }
+                    },
+                },
+                {"time": 3.0, "check": {"pattern_agreement": 0.9, "rival": None}},
+            ],
+        }, Path("clip.mp4"), None)
+        with patch.object(poses.rr, "log") as log, patch.object(
+            poses.rr, "Points3D"
+        ) as markers:
+            places = poses.log_rivals(camera)
+
+        # Two frames at the same half-metre place are one marker, not two.
+        self.assertEqual(len(places), 1)
+        self.assertIn("2 frame(s)", places[0])
+        self.assertEqual(log.call_args.args[0], "world/rivals/clip")
+        drawn = markers.call_args
+        self.assertEqual(drawn.args[0], [[9.0, -0.5, 2.0]])
+        self.assertIn("the mount is not there", drawn.kwargs["labels"][0])
+
+        # A file with no rival anywhere logs nothing at all: an empty marker set
+        # in the viewer reads as "the pose is certain", which is a lie.
+        alone = poses.Camera("sure", {
+            "solved": [{"time": 1.0, "check": {"rival": None}}],
+        }, None, None)
+        with patch.object(poses.rr, "log") as log:
+            self.assertEqual(poses.log_rivals(alone), [])
+        log.assert_not_called()
+
     def test_unmeasured_start_has_no_camera_pinhole_or_fabricated_pose(self):
         camera = poses.Camera("clip", {
             "frame_width": 160, "frame_height": 120, "horizontal_fov_deg": 60.0,
