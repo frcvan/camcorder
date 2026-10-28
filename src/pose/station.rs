@@ -1,23 +1,29 @@
 //! Treating the frames of one file as one camera that did not move.
 //!
-//! Two things are only knowable across frames, and both are worth more than any
+//! Three things are only knowable across frames, and all are worth more than any
 //! single frame's answer:
 //!
-//! * **The focal length.** `--fov` is a guess, and for a single tag the whole
-//!   pose is scaled by it: a five percent error in the assumed field of view
-//!   moves the camera by half a metre and the corners still fit perfectly. A
-//!   frame holding two tags does not have to take the guess — its tags are a
-//!   known distance apart on the field, so the only focal length that puts them
-//!   there is measurable from the picture. [`calibrate`] measures it and the
-//!   estimate then re-solves every frame with it.
+//! * **The focal length.** `--fov` is a guess, and the whole pose is scaled by
+//!   it: a five percent error in the assumed field of view moves the camera by
+//!   half a metre and the corners still fit perfectly. [`measure_lens`] fits one
+//!   lens to the frames of a shot at once — a shared centre, a rotation per
+//!   frame, one focal length, and a radial distortion term only if the picture
+//!   asks for one — and reports the band of lenses that explains them just as
+//!   well. A band is not a measurement, and the report says which it has.
+//! * **Where one shot ends and the next begins.** A pane is one camera, but it
+//!   can be re-aimed between samples; [`shots`] splits the file where a tag both
+//!   samples see has moved across the frame, so one station is not fitted to two
+//!   framings.
 //! * **The camera's position.** A broadcast camera is bolted to a stand and
 //!   does not wander between sampled frames; the spread of the per-frame poses
 //!   is corner noise, not motion. [`fit`] fits one pose to every frame's corners
 //!   at once, which averages that noise away, and rejects the frames that do not
 //!   belong to it — a pan, or a stray solve.
 //!
-//! Both are reported next to the per-frame poses rather than replacing them: a
+//! All are reported next to the per-frame poses rather than replacing them: a
 //! camera that really did pan should still be visible as having panned.
+
+use std::ops::Range;
 
 use super::{
     layout::TagLayout,
@@ -30,19 +36,45 @@ use super::{
 /// camera covers a handful of focal lengths in its zoom range, so a "measurement"
 /// outside this is a bad frame, not a lens.
 const FOCAL_RANGE: (f64, f64) = (0.5, 2.5);
-/// How much better the fit has to explain the corners at the measured focal
-/// length before the measurement is believed. Two tags a metre apart pin the
-/// focal length well; two tags whose corners are a pixel noisy do not, and this
-/// keeps a noise minimum from being reported as a calibration.
-const CALIBRATION_GAIN: f64 = 0.75;
-/// How many frames have to measure the lens before it is re-solved with their
-/// median. One frame is not evidence: on a real broadcast pane, a single frame
-/// holding two tags 36cm apart "measured" a focal length at the floor of the
-/// allowed range, halved every distance in the video, and put the camera at
-/// knee height inside the field. Two frames that have to agree cannot do that.
-const MIN_CALIBRATION_FRAMES: usize = 2;
-/// Measurements farther apart than 20% do not describe the same lens.
-const MAX_FOCAL_DISAGREEMENT: f64 = 1.2;
+/// How much better the fitted lens has to explain the frames before it is used
+/// in place of the `--fov` guess when the footage cannot pin it exactly. A
+/// number that only wins by noise would move every distance in the video.
+const LENS_GAIN: f64 = 0.75;
+/// …and the least improvement in pixels that counts at all, so a fixture solved
+/// to a thousandth of a pixel does not "find" a lens it cannot see.
+const LENS_MIN_DROP_PX: f64 = 0.2;
+/// A lens is *measured* only if the band of lenses the footage allows is worth
+/// less than this many metres of camera position, which is the band's width
+/// times the distance to the tags. A ratio alone cannot say that: 5% of
+/// 1841px is 10cm of a camera a metre away and 1.5m of one thirty metres away,
+/// and it is the metres a reader acts on.
+const LENS_REACH_M: f64 = 0.5;
+/// Lenses tried across the whole range before the search narrows in. A grid
+/// rather than a pure bisection because the residual as a function of focal
+/// length is not convex: a lone tag's corners fit at every focal length, so the
+/// surface has flat valleys, and a search that starts in one reports its floor.
+const LENS_GRID: usize = 11;
+const LENS_STEPS: usize = 18;
+/// How many bisections turn "still explains the frames this far out" into the
+/// censored bound a report can quote: 2.5% of the range per step.
+const LENS_BISECTIONS: usize = 6;
+/// Radial distortion the picture is allowed to ask for, dimensionless.
+const DISTORTION_RANGE: (f64, f64) = (-0.25, 0.25);
+/// Pixels out of square the picture is allowed to ask for, as a ratio.
+const ASPECT_RANGE: (f64, f64) = (0.95, 1.05);
+/// A distortion or pixel-aspect term has to explain the frames this much better
+/// before it is kept. Most footage has neither, and fitting them anyway hands
+/// the solver two more ways to absorb a noisy corner.
+const EXTRA_PARAM_GAIN: f64 = 0.9;
+/// Frames a lens fit needs before it can measure anything: one frame has
+/// nothing to agree with, and on real footage a single pane frame holding two
+/// tags 36cm apart once halved the focal length of the whole video.
+const MIN_LENS_FRAMES: usize = 2;
+/// A shot ends when a tag that both samples see has moved this far, as a
+/// fraction of the frame's width: the camera was re-aimed, not merely noisy.
+const SHOT_SHIFT_FRACTION: f64 = 0.10;
+/// …or when the samples are this far apart and share no tag to compare.
+const SHOT_GAP_S: f64 = 20.0;
 /// A frame is dropped from the station pose when it reprojects worse than this
 /// many times the median frame, or worse than the absolute floor. A pan shows
 /// up as exactly this: most frames agree, a few are elsewhere.
@@ -57,6 +89,10 @@ const MOST_ROUNDS: usize = 3;
 /// One frame's contribution to the cross-frame fits.
 #[derive(Debug, Clone)]
 pub(crate) struct View {
+    /// Seconds into the video this frame was taken. The lens fit is one per
+    /// station, but a pane holds more than one shot when the camera is re-aimed,
+    /// and telling those apart needs the clock as well as the picture.
+    pub time: f64,
     /// The corners the per-frame solve agreed on.
     pub corners: Vec<Correspondence>,
     /// The pose the per-frame solve found.
@@ -71,20 +107,53 @@ pub(crate) struct View {
 #[derive(Debug, Clone)]
 pub(crate) struct Calibration {
     pub intrinsics: Intrinsics,
-    /// Whether the focal length was measured from the footage or assumed.
+    /// Whether the footage pins the focal length closely enough to quote it as
+    /// a measurement. A best fit over a wide band is not a measurement, however
+    /// much better it explains the frames than the guess did.
     pub measured: bool,
-    /// Frames that contributed a usable measurement.
+    /// Whether a lens fit was made at all, and so whether `range` says anything.
+    /// A measurement is a fit that is both made and pinned.
+    pub fitted: bool,
+    /// Frames the lens fit was based on.
     pub frames: usize,
-    /// The measured focal length as a multiple of the assumed one.
+    /// The fitted focal length as a multiple of the assumed one.
     pub ratio: f64,
+    /// The focal lengths the footage could not rule out, pixels, censored at the
+    /// search range. `None` when no lens fit was possible at all. This is the
+    /// number that stops a scale-limited pane from being read as a position: on
+    /// the Houston final's overview pane the frames are explained equally well
+    /// 550px and 1200px along, and two metres of camera position apart.
+    pub range: Option<(f64, f64)>,
+    /// Whether radial distortion was fitted rather than left at zero.
+    pub k1_measured: bool,
+    /// Whether the pixels were found to be out of square.
+    pub aspect_measured: bool,
+    /// What the focal band is worth in camera position at the distance the tags
+    /// are seen from, metres: the band's width times that distance. This is the
+    /// number that decides whether the lens counts as measured.
+    pub reach_m: Option<f64>,
 }
 
 impl Calibration {
+    fn assumed(intrinsics: Intrinsics) -> Self {
+        Calibration {
+            intrinsics,
+            measured: false,
+            fitted: false,
+            frames: 0,
+            ratio: 1.0,
+            range: None,
+            k1_measured: false,
+            aspect_measured: false,
+            reach_m: None,
+        }
+    }
+
     /// One line for the report: the focal length and how it was arrived at.
     pub fn describe(&self) -> String {
-        if self.measured {
+        let mut said = if self.measured {
             format!(
-                "focal length measured from {} frame(s) with two or more tags: {:.0}px ({:.0}°), {} the --fov guess",
+                "focal length measured from {} frame(s) of one station: {:.0}px ({:.0}°), {} the --fov guess",
                 self.frames,
                 self.intrinsics.fx,
                 horizontal_fov_deg(&self.intrinsics),
@@ -94,13 +163,54 @@ impl Calibration {
                     off => format!("{:.0}% below", off * 100.0),
                 }
             )
+        } else if self.fitted && (self.ratio - 1.0).abs() > 0.02 {
+            // The fit found a lens that explains the frames by a real margin,
+            // but the footage cannot say which lens: report where it could be
+            // rather than pretending the best point is it. The metres are the
+            // point — at twenty metres a 10% band is two metres of camera.
+            let (low, high) = self
+                .range
+                .unwrap_or((self.intrinsics.fx, self.intrinsics.fx));
+            format!(
+                "focal length fitted from {} frame(s) but not pinned: {:.0}px ({:.0}°); anything from {:.0} to {:.0}px explains these frames as well, which is up to {:.1}m of camera position",
+                self.frames,
+                self.intrinsics.fx,
+                horizontal_fov_deg(&self.intrinsics),
+                low,
+                high,
+                self.reach_m.unwrap_or(0.0)
+            )
+        } else if let Some((low, high)) = self.range.filter(|_| self.fitted) {
+            format!(
+                "focal length assumed from --fov: {:.0}px ({:.0}°); the frames would fit anywhere from {:.0} to {:.0}px, which is up to {:.1}m of camera position",
+                self.intrinsics.fx,
+                horizontal_fov_deg(&self.intrinsics),
+                low,
+                high,
+                self.reach_m.unwrap_or(0.0)
+            )
         } else {
             format!(
                 "focal length assumed from --fov: {:.0}px ({:.0}°)",
                 self.intrinsics.fx,
                 horizontal_fov_deg(&self.intrinsics)
             )
+        };
+        if self.k1_measured {
+            said.push_str(&format!(
+                ", radial distortion k1 = {:.3}",
+                self.intrinsics.k1
+            ));
         }
+        if self.aspect_measured {
+            let taller = self.intrinsics.fy / self.intrinsics.fx;
+            said.push_str(&format!(
+                ", pixels {:.1}% {} than square",
+                (taller - 1.0).abs() * 100.0,
+                if taller > 1.0 { "taller" } else { "wider" }
+            ));
+        }
+        said
     }
 }
 
@@ -118,131 +228,375 @@ fn with_focal(camera: &Intrinsics, ratio: f64) -> Intrinsics {
     }
 }
 
-/// Measure the focal length from the frames that can measure it.
+/// Measure the lens from the frames of one station.
 ///
-/// A single tag cannot: its four corners fix only the ratio of size to distance,
-/// so every focal length has a pose that fits them. Two tags a known distance
-/// apart do fix it, which is why only those frames are used. The median across
-/// frames is taken rather than the mean, because one frame with a mis-read tag
-/// should not move the lens.
-pub(crate) fn calibrate(views: &[View], assumed: Intrinsics) -> Calibration {
-    let mut ratios = Vec::new();
-    for view in views {
-        if view.tags.len() < 2 || view.corners.len() < 8 {
-            continue;
-        }
-        let Some(measured) = focal_ratio(view, &assumed) else {
-            continue;
-        };
-        ratios.push(measured);
+/// A single frame cannot: a lone tag's four corners fix only the ratio of size
+/// to distance, so every focal length has a pose that fits them. The fit here is
+/// therefore joint — one centre, one lens, a rotation for each frame — and it is
+/// run across a band of candidate lenses, a grid first and then a golden section
+/// inside the best bracket, because the residual is not convex in focal length:
+/// a lone tag leaves whole flat valleys, and a search that starts in one
+/// descends to its floor and calls it the lens.
+///
+/// What comes back is not only a number. The band of lenses that still explains
+/// the frames is the honest width of the answer. On the Houston final's overview
+/// pane the tags stand in clusters 35cm apart, which at twenty metres is no
+/// baseline at all, and the frames are explained equally well by 550px and
+/// 1200px — two metres of camera position apart. A single number there would be
+/// a lie with a decimal point on it, so the band is reported and the position is
+/// read as the scaled thing it is.
+///
+/// The guess is kept unless the fit either pins the lens or explains the frames
+/// by a real margin better, because a lens chosen by noise moves every distance
+/// in the video.
+pub(crate) fn measure_lens(views: &[View], assumed: Intrinsics, max_rms_px: f64) -> Calibration {
+    let usable: Vec<View> = views
+        .iter()
+        .filter(|view| view.corners.len() >= 4)
+        .cloned()
+        .collect();
+    if usable.len() < MIN_LENS_FRAMES {
+        return Calibration::assumed(assumed);
     }
-    let Some((ratio, frames)) = agreeing_focal_ratio(&mut ratios) else {
-        return Calibration {
-            intrinsics: assumed,
-            measured: false,
-            frames: 0,
-            ratio: 1.0,
-        };
+    let cost = |camera: &Intrinsics| joint_rms(&usable, camera);
+
+    let Some(at_assumed) = cost(&assumed) else {
+        return Calibration::assumed(assumed);
     };
-    Calibration {
-        intrinsics: with_focal(&assumed, ratio),
-        measured: true,
-        frames,
-        ratio,
-    }
-}
 
-/// A majority of independent measurements must agree before setting the lens.
-fn agreeing_focal_ratio(ratios: &mut [f64]) -> Option<(f64, usize)> {
-    ratios.sort_by(f64::total_cmp);
-    let mut best = (0, 0);
-    let mut end = 0;
-    for start in 0..ratios.len() {
-        while end < ratios.len() && ratios[end] <= ratios[start] * MAX_FOCAL_DISAGREEMENT {
-            end += 1;
-        }
-        if end - start > best.1 - best.0 {
-            best = (start, end);
-        }
-    }
-    let count = best.1 - best.0;
-    if count < MIN_CALIBRATION_FRAMES || count * 2 <= ratios.len() {
-        return None;
-    }
-    Some((ratios[best.0 + count / 2], count))
-}
-
-/// The focal-length multiple that best explains one frame's corners.
-fn focal_ratio(view: &View, assumed: &Intrinsics) -> Option<f64> {
-    let at_assumed = fit_rms(&view.corners, assumed, view.pose)?;
-    // A fit that is already perfect cannot be improved on, and a search that
-    // starts there would report whatever it landed on as the measurement.
-    if at_assumed < 1e-6 {
-        return None;
-    }
-
-    // Golden-section search in log space: the fit is smooth in the focal
-    // length but varies over a factor of a few, so equal steps in the log are
-    // equal steps in what the search can see.
     let (low, high) = (FOCAL_RANGE.0.ln(), FOCAL_RANGE.1.ln());
-    let golden = 0.618_033_988_749_895;
-    let mut a = low;
-    let mut b = high;
-    let mut c = b - golden * (b - a);
-    let mut d = a + golden * (b - a);
-    let mut cost_c = cost_at(&view.corners, assumed, view.pose, c);
-    let mut cost_d = cost_at(&view.corners, assumed, view.pose, d);
-    for _ in 0..28 {
+    let step = (high - low) / (LENS_GRID - 1) as f64;
+    let mut grid = Vec::with_capacity(LENS_GRID);
+    for index in 0..LENS_GRID {
+        let ln = low + step * index as f64;
+        let value = cost(&with_focal(&assumed, ln.exp())).unwrap_or(f64::INFINITY);
+        if super::debug_enabled() {
+            eprintln!(
+                "  [lens] {:.0}px ({:.0}°): {:.3}px rms over {} frame(s)",
+                ln.exp() * assumed.fx,
+                horizontal_fov_deg(&with_focal(&assumed, ln.exp())),
+                value,
+                usable.len()
+            );
+        }
+        grid.push((ln, value));
+    }
+    let Some(&(start, _)) = grid
+        .iter()
+        .filter(|(_, value)| value.is_finite())
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+    else {
+        return Calibration::assumed(assumed);
+    };
+    // A minimum sitting on the edge of the range is the search running out of
+    // room, not the picture saying what the lens is.
+    if start - low < step * 0.5 || high - start < step * 0.5 {
+        return Calibration::assumed(assumed);
+    }
+    let (ln_ratio, mut best) = golden((start - step).max(low), (start + step).min(high), |ln| {
+        cost(&with_focal(&assumed, ln.exp())).unwrap_or(f64::INFINITY)
+    });
+
+    // Distortion and pixel aspect, each only if it buys something real. A pane
+    // whose tags never move in the picture cannot tell either apart from a
+    // slightly different pose, and would hand the solver two free parameters to
+    // absorb corner noise with.
+    let mut camera = with_focal(&assumed, ln_ratio.exp());
+    let mut k1_measured = false;
+    let mut aspect_measured = false;
+    let (k1, k1_cost) = golden(DISTORTION_RANGE.0, DISTORTION_RANGE.1, |k1| {
+        cost(&Intrinsics { k1, ..camera }).unwrap_or(f64::INFINITY)
+    });
+    if super::debug_enabled() {
+        eprintln!(
+            "  [lens] radial k1 {:.3}: {:.3}px rms, against {:.3}px at k1 = 0",
+            k1, k1_cost, best
+        );
+    }
+    // …and neither may sit on the edge of what it is allowed to be: a bend the
+    // search ran out of room for is the bound, not the picture, and taking it
+    // hands every frame a distortion chosen by the clamp.
+    let interior = |value: f64, (low, high): (f64, f64)| {
+        let margin = (high - low) * 0.05;
+        value > low + margin && value < high - margin
+    };
+    if worth(best, k1_cost) && interior(k1, DISTORTION_RANGE) {
+        camera.k1 = k1;
+        best = k1_cost;
+        k1_measured = true;
+    }
+    let focal = camera.fx;
+    let (aspect, aspect_cost) = golden(ASPECT_RANGE.0, ASPECT_RANGE.1, |aspect| {
+        cost(&Intrinsics {
+            fy: focal * aspect,
+            ..camera
+        })
+        .unwrap_or(f64::INFINITY)
+    });
+    if worth(best, aspect_cost) && interior(aspect, ASPECT_RANGE) {
+        camera.fy = focal * aspect;
+        aspect_measured = true;
+    }
+    // One more look at the focal length now the extra terms have settled, so
+    // the three are not left in the order they happened to be searched in. The
+    // step here is relative to the camera as it now stands, so it is centred on
+    // zero rather than on the first search's answer.
+    let low_now = (FOCAL_RANGE.0 * assumed.fx / camera.fx).ln();
+    let high_now = (FOCAL_RANGE.1 * assumed.fx / camera.fx).ln();
+    let (ln_shift, best) = golden(
+        (-step * 0.5).max(low_now),
+        (step * 0.5).min(high_now),
+        |ln| cost(&with_focal(&camera, ln.exp())).unwrap_or(f64::INFINITY),
+    );
+    // A lens fit that does not even reproject the frames within the run's own
+    // error limit has not measured a lens: the frames do not agree on a camera,
+    // and their disagreement is not evidence about the glass.
+    if !best.is_finite() || best > max_rms_px {
+        return Calibration::assumed(assumed);
+    }
+    camera = with_focal(&camera, ln_shift.exp());
+
+    // How far the lens can move before the frames stop explaining themselves: a
+    // bound measured the same way as `sigma_m`, since it is the same question
+    // asked about a different unknown.
+    let tolerance = (best * best + PTZ_SLACK_PX2).sqrt();
+    let floor = (FOCAL_RANGE.0 * assumed.fx / camera.fx).ln();
+    let ceiling = (FOCAL_RANGE.1 * assumed.fx / camera.fx).ln();
+    let lo = focal_limit(&cost, &camera, floor, tolerance).exp();
+    let hi = focal_limit(&cost, &camera, ceiling, tolerance).exp();
+    let (lo_px, hi_px) = (camera.fx * lo, camera.fx * hi);
+
+    // What the band is worth where the tags actually are: a narrow band on a
+    // far camera is a wide band in metres, and metres are what the report is
+    // read for.
+    let distance = joint_fit(&usable, &camera).map_or(0.0, |(_, distance)| distance);
+    let reach_m = (hi / lo - 1.0) * distance;
+    let measured = reach_m <= LENS_REACH_M;
+    let improvement = at_assumed - best;
+    let used = measured || (improvement > LENS_MIN_DROP_PX && best <= at_assumed * LENS_GAIN);
+    let intrinsics = if used { camera } else { assumed };
+    Calibration {
+        intrinsics,
+        measured,
+        fitted: true,
+        frames: usable.len(),
+        ratio: intrinsics.fx / assumed.fx,
+        range: Some((lo_px, hi_px)),
+        k1_measured,
+        aspect_measured,
+        reach_m: Some(reach_m),
+    }
+}
+
+/// Whether a term the frames did not have to pay for is worth keeping: it has to
+/// explain them by a clear margin, both in proportion and in pixels, or a noisy
+/// corner is enough to conjure it.
+fn worth(best: f64, candidate: f64) -> bool {
+    candidate.is_finite()
+        && candidate <= best * EXTRA_PARAM_GAIN
+        && best - candidate > LENS_MIN_DROP_PX
+}
+
+/// Golden-section minimum of `cost` on `[a, b]`, in whatever space the caller
+/// passed — the lens is searched in the log of the focal length, so a factor of
+/// two is the same distance wherever it sits.
+fn golden(mut a: f64, mut b: f64, mut cost: impl FnMut(f64) -> f64) -> (f64, f64) {
+    const PHI: f64 = 0.618_033_988_749_895;
+    let mut c = b - PHI * (b - a);
+    let mut d = a + PHI * (b - a);
+    let (mut cost_c, mut cost_d) = (cost(c), cost(d));
+    for _ in 0..LENS_STEPS {
+        if !cost_c.is_finite() && !cost_d.is_finite() {
+            break;
+        }
         if cost_c <= cost_d {
             b = d;
             d = c;
             cost_d = cost_c;
-            c = b - golden * (b - a);
-            cost_c = cost_at(&view.corners, assumed, view.pose, c);
+            c = b - PHI * (b - a);
+            cost_c = cost(c);
         } else {
             a = c;
             c = d;
             cost_c = cost_d;
-            d = a + golden * (b - a);
-            cost_d = cost_at(&view.corners, assumed, view.pose, d);
-        }
-        if !cost_c.is_finite() || !cost_d.is_finite() {
-            return None;
+            d = a + PHI * (b - a);
+            cost_d = cost(d);
         }
     }
-    let best = (a + b) * 0.5;
-    // A minimum still sitting on the edge of the range is not a measurement:
-    // the search ran out of room, so the frame wants a lens outside what a
-    // broadcast camera covers. Reporting the bound would hand every other frame
-    // the number the search stopped at rather than the one the picture asks for.
-    let edge = 1e-3;
-    if (best - low).abs() < edge || (high - best).abs() < edge {
-        return None;
-    }
-    let ratio = best.exp();
-    let at_best = cost_at(&view.corners, assumed, view.pose, best);
-    // The measurement has to be a real improvement: otherwise this frame's
-    // corners are too noisy to say anything about the lens, and pretending
-    // otherwise would hand every other frame a worse focal length.
-    if !at_best.is_finite() || at_best >= at_assumed * CALIBRATION_GAIN {
-        return None;
-    }
-    Some(ratio)
+    let middle = 0.5 * (a + b);
+    let value = cost(middle);
+    (
+        middle,
+        if value.is_finite() {
+            value
+        } else {
+            f64::INFINITY
+        },
+    )
 }
 
-fn cost_at(
-    corners: &[Correspondence],
-    assumed: &Intrinsics,
-    start: CameraPose,
-    ln_ratio: f64,
+/// How far the lens can be scaled from the fitted one before the frames stop
+/// explaining themselves, by bisection towards `edge_ln`. Returns `edge_ln`
+/// when even the edge is not ruled out — the answer is then "more than this",
+/// and the caller quotes the edge as the censored bound.
+fn focal_limit(
+    cost: &impl Fn(&Intrinsics) -> Option<f64>,
+    base: &Intrinsics,
+    edge_ln: f64,
+    tolerance: f64,
 ) -> f64 {
-    let camera = with_focal(assumed, ln_ratio.exp());
-    fit_rms(corners, &camera, start).unwrap_or(f64::INFINITY)
+    let within =
+        |ln: f64| cost(&with_focal(base, ln.exp())).is_some_and(|value| value <= tolerance);
+    if within(edge_ln) {
+        return edge_ln;
+    }
+    let (mut good, mut bad) = (0.0, edge_ln);
+    for _ in 0..LENS_BISECTIONS {
+        let middle = 0.5 * (good + bad);
+        if within(middle) {
+            good = middle;
+        } else {
+            bad = middle;
+        }
+    }
+    good
 }
 
-/// The best fit's reprojection error at one focal length.
-fn fit_rms(corners: &[Correspondence], camera: &Intrinsics, start: CameraPose) -> Option<f64> {
-    solve::refine(start, corners, camera).map(|solution| solution.rms_px)
+/// The reprojection error of one station fitted with `camera` as its lens.
+///
+/// Each frame is solved on its own at the candidate lens first, and the shared
+/// centre starts from where those solutions agree. That matters more than it
+/// sounds: starting every candidate from the pose the *assumed* lens found would
+/// compare lenses by how close they sit to the guess rather than by what the
+/// picture says, and a fit that only reached a local minimum would then look
+/// like a measurement of the lens.
+///
+/// The field-model lines are deliberately left out: they arrive after this, and
+/// they are evidence about the mount rather than about the lens.
+fn joint_rms(views: &[View], camera: &Intrinsics) -> Option<f64> {
+    joint_fit(views, camera).map(|(rms, _)| rms)
+}
+
+/// The same fit, together with how far the tags are from it: the reprojection
+/// error says how well it explains the frames, the distance says what a
+/// focal-length error is worth out on the field.
+fn joint_fit(views: &[View], camera: &Intrinsics) -> Option<(f64, f64)> {
+    let solved: Vec<CameraPose> = views
+        .iter()
+        .map(|view| solve::refine(view.pose, &view.corners, camera).map(|solution| solution.pose))
+        .collect::<Option<Vec<_>>>()?;
+    let positions: Vec<super::types::Vec3> = solved.iter().map(|pose| pose.position).collect();
+    let (centre, _) = consensus(&positions);
+    // A frame that solved to the other side of the wall has an aim fitted from
+    // a place the camera was never at; from the real centre it points away, and
+    // the residual behind the camera is flat, with no slope to descend. The
+    // nearest frame that did agree has an aim worth starting from.
+    let stray: Vec<bool> = solved
+        .iter()
+        .map(|pose| (pose.position - centre).norm() > CONSENSUS_RADIUS_M)
+        .collect();
+    let ptz: Vec<solve::PtzView> = views
+        .iter()
+        .zip(&solved)
+        .enumerate()
+        .map(|(index, (view, pose))| solve::PtzView {
+            corners: view.corners.clone(),
+            lines: Vec::new(),
+            pose: CameraPose {
+                position: centre,
+                rotation: if stray[index] {
+                    nearest_agreeing_aim(&solved, &stray, pose.position).unwrap_or(pose.rotation)
+                } else {
+                    pose.rotation
+                },
+            },
+            camera: *camera,
+        })
+        .collect();
+    let fitted = solve::refine_ptz_pinned(&ptz, false)?;
+    let mut total = super::types::Vec3::new(0.0, 0.0, 0.0);
+    let mut count = 0usize;
+    for view in views {
+        for corner in &view.corners {
+            total = total + corner.field;
+            count += 1;
+        }
+    }
+    let middle = total * (1.0 / count.max(1) as f64);
+    Some((ptz_rms(&fitted), (centre - middle).norm()))
+}
+
+/// Split a pane into the shots it actually holds.
+///
+/// A file is one pane of the broadcast frame, and on a fixed camera the whole
+/// file is one shot. But a pane can be re-aimed, and a long gap between samples
+/// can hide a cut; fitting one station to two shots puts the camera between them,
+/// which is what a pan mixed into a static shot looked like before this existed.
+/// The per-frame orientations stay in the report either way — a camera that
+/// really panned has to keep showing as having panned — but the shared position
+/// belongs to the shot it was fitted from.
+///
+/// The test is the picture, not the per-frame pose: a tag that both samples see
+/// has moved a tenth of the frame across means the camera was re-aimed, while a
+/// lone tag's own solve can be metres out and on either side of the wall without
+/// the camera having moved at all.
+pub(crate) fn shots(views: &[View], camera: &Intrinsics) -> Vec<Range<usize>> {
+    let mut shots = Vec::new();
+    if views.is_empty() {
+        return shots;
+    }
+    let mut start = 0;
+    for index in 1..views.len() {
+        if !same_shot(&views[index - 1], &views[index], camera) {
+            shots.push(start..index);
+            start = index;
+        }
+    }
+    shots.push(start..views.len());
+    shots
+}
+
+fn same_shot(a: &View, b: &View, camera: &Intrinsics) -> bool {
+    match shared_shift(a, b) {
+        Some(shift) => shift <= camera.width as f64 * SHOT_SHIFT_FRACTION,
+        // Nothing in the picture to compare. A short gap is still the same shot;
+        // a long one, with the camera free to have been moved in between, is not.
+        None => b.time - a.time <= SHOT_GAP_S,
+    }
+}
+
+/// How far the farthest corner of a tag both frames saw has moved, in pixels.
+fn shared_shift(a: &View, b: &View) -> Option<f64> {
+    let mut shift: Option<f64> = None;
+    for corner in &a.corners {
+        for other in &b.corners {
+            if (corner.field - other.field).norm() > 1e-9 {
+                continue;
+            }
+            let moved = (corner.image.0 - other.image.0).hypot(corner.image.1 - other.image.1);
+            shift = Some(shift.map_or(moved, |biggest: f64| biggest.max(moved)));
+        }
+    }
+    shift
+}
+
+/// The shot the camera spent most of the file in, and the one the reported
+/// station is fitted from.
+///
+/// Counted by the frames whose own solve agrees with the shot's centre, not by
+/// the number of samples: a shot is evidence only where the frames in it are
+/// evidence about the same place.
+pub(crate) fn busiest_shot(views: &[View], shots: &[Range<usize>]) -> Range<usize> {
+    shots
+        .iter()
+        .max_by_key(|shot| {
+            (
+                consensus_position(&views[shot.start..shot.end]).1,
+                shot.len(),
+            )
+        })
+        .cloned()
+        .unwrap_or(0..0)
 }
 
 /// One camera pose for the frames that share it.
@@ -589,25 +943,43 @@ fn nearby_aim(
     stray: &[bool],
     from: super::types::Vec3,
 ) -> Option<super::types::Quat> {
-    views
+    let poses: Vec<CameraPose> = views.iter().map(|view| view.pose).collect();
+    nearest_agreeing_aim(&poses, stray, from)
+}
+
+/// The same, over already-solved poses: the lens fit works with those rather
+/// than with the frames' own solves.
+fn nearest_agreeing_aim(
+    poses: &[CameraPose],
+    stray: &[bool],
+    from: super::types::Vec3,
+) -> Option<super::types::Quat> {
+    poses
         .iter()
         .zip(stray)
         .filter(|(_, stray)| !**stray)
         .min_by(|(a, _), (b, _)| {
-            (a.pose.position - from)
+            (a.position - from)
                 .norm()
-                .total_cmp(&(b.pose.position - from).norm())
+                .total_cmp(&(b.position - from).norm())
         })
-        .map(|(view, _)| view.pose.rotation)
+        .map(|(pose, _)| pose.rotation)
 }
 
 fn consensus_position(views: &[View]) -> (super::types::Vec3, usize) {
-    let mut best = (views[0].pose.position, 0usize);
-    for view in views {
-        let agreeing: Vec<super::types::Vec3> = views
+    let positions: Vec<super::types::Vec3> = views.iter().map(|view| view.pose.position).collect();
+    consensus(&positions)
+}
+
+/// The mean of the largest group of positions within [`CONSENSUS_RADIUS_M`] of
+/// each other, and how many positions that is.
+fn consensus(positions: &[super::types::Vec3]) -> (super::types::Vec3, usize) {
+    let mut best = (positions[0], 0usize);
+    for position in positions {
+        let agreeing: Vec<super::types::Vec3> = positions
             .iter()
-            .map(|other| other.pose.position)
-            .filter(|other| (*other - view.pose.position).norm() <= CONSENSUS_RADIUS_M)
+            .copied()
+            .filter(|other| (*other - *position).norm() <= CONSENSUS_RADIUS_M)
             .collect();
         if agreeing.len() > best.1 {
             let centre = agreeing
@@ -779,6 +1151,7 @@ mod tests {
                 let pose = look_at(position, Vec3::new(target, 6.0, 0.5));
                 let camera = Intrinsics::from_horizontal_fov(1920, 1080, fov);
                 View {
+                    time: 0.0,
                     corners: corners_of(&layout, &[3, 4, 5], 0.1651, pose, &camera),
                     pose,
                     tags: vec![3, 4, 5],
@@ -809,6 +1182,7 @@ mod tests {
             .map(|target| {
                 let pose = look_at(position, Vec3::new(target, 6.0, 0.5));
                 View {
+                    time: 0.0,
                     corners: corners_of(&layout, &[3], 0.1651, pose, &camera),
                     pose,
                     tags: vec![3],
@@ -875,6 +1249,7 @@ mod tests {
                 ),
             );
             views.push(View {
+                time: 0.0,
                 corners: corners_of(&layout, &[5], 0.1651, pose, &camera),
                 pose,
                 tags: vec![5],
@@ -894,6 +1269,7 @@ mod tests {
         // alone leaves the frame unexplained forever.
         let away = look_at(truth_position, truth_position + normal * 10.0);
         views.push(View {
+            time: 0.0,
             corners: views[1].corners.clone(),
             pose: CameraPose {
                 position: Vec3::new(8.0, 0.0, 2.3),
@@ -970,12 +1346,14 @@ mod tests {
                 .collect();
             assert!(!lines.is_empty(), "the structure should project into shot");
             plain.push(View {
+                time: 0.0,
                 corners: corners.clone(),
                 pose,
                 tags: vec![5],
                 lines: Vec::new(),
             });
             with_model.push(View {
+                time: 0.0,
                 corners,
                 pose,
                 tags: vec![5],
@@ -1025,18 +1403,29 @@ mod tests {
         let corners = corners_of(&layout, &[3, 4], 0.1651, pose, &truth);
         let views: Vec<View> = (0..3)
             .map(|_| View {
+                time: 0.0,
                 corners: corners.clone(),
                 pose,
                 tags: vec![3, 4],
                 lines: vec![],
             })
             .collect();
-        let calibration = calibrate(&views, assumed);
-        assert!(calibration.measured, "two tags should measure the lens");
+        let calibration = measure_lens(&views, assumed, 8.0);
+        assert!(calibration.fitted, "two tags should pin the lens to a band");
         assert_eq!(calibration.frames, 3);
+        let (low, high) = calibration.range.expect("a band");
+        // The band has to contain the lens the picture was drawn with, and be
+        // narrow enough to be worth acting on. It is not a point: two tags on
+        // one wall, seen from one place, leave a scale the principal point
+        // barely separates, which is why this is a band and not a number.
         assert!(
-            (calibration.intrinsics.fx - truth.fx).abs() / truth.fx < 0.02,
-            "measured {:.0}px against {:.0}px",
+            low <= truth.fx && truth.fx <= high,
+            "the true lens {:.0}px is outside the reported {low:.0}–{high:.0}px",
+            truth.fx
+        );
+        assert!(
+            (calibration.intrinsics.fx - truth.fx).abs() / truth.fx < 0.10,
+            "fitted {:.0}px against {:.0}px",
             calibration.intrinsics.fx,
             truth.fx
         );
@@ -1069,6 +1458,7 @@ mod tests {
         let views: Vec<View> = [50.0, 65.0]
             .into_iter()
             .map(|fov| View {
+                time: 0.0,
                 corners: corners_of(
                     &layout,
                     &[3, 4],
@@ -1081,20 +1471,16 @@ mod tests {
                 lines: vec![],
             })
             .collect();
-        for view in &views {
-            assert!(
-                focal_ratio(view, &assumed).is_some(),
-                "each frame must independently measure"
-            );
-        }
-        let calibration = calibrate(&views, assumed);
+        let calibration = measure_lens(&views, assumed, 8.0);
+        // Neither frame can be the lens's evidence when they want different
+        // ones: the joint fit cannot explain both, so there is no lens to
+        // report rather than a compromise the reader would take as measured.
         assert!(
-            !calibration.measured,
-            "conflicting measurements must not set the lens"
+            !calibration.fitted,
+            "two frames that want different lenses still produced a lens"
         );
+        assert!(!calibration.measured);
         assert_eq!(calibration.intrinsics, assumed);
-        assert_eq!(agreeing_focal_ratio(&mut [0.8, 1.4, 1.42]), Some((1.42, 2)));
-        assert_eq!(agreeing_focal_ratio(&mut [0.8, 0.81, 1.4, 1.42]), None);
     }
 
     #[test]
@@ -1112,17 +1498,16 @@ mod tests {
         let pose = look_at(Vec3::new(2.0, 1.0, 4.0), Vec3::new(7.5, 6.0, 0.5));
         let assumed = Intrinsics::from_horizontal_fov(1920, 1080, 75.0);
         let views = vec![View {
+            time: 0.0,
             corners: corners_of(&layout, &[3, 4], 0.1651, pose, &truth),
             pose,
             tags: vec![3, 4],
             lines: vec![],
         }];
 
-        let calibration = calibrate(&views, assumed);
-        assert!(
-            !calibration.measured,
-            "one frame must not calibrate the lens"
-        );
+        let calibration = measure_lens(&views, assumed, 8.0);
+        assert!(!calibration.fitted, "one frame must not calibrate the lens");
+        assert!(!calibration.measured);
         assert_eq!(calibration.intrinsics, assumed);
     }
 
@@ -1142,6 +1527,7 @@ mod tests {
         let corners = corners_of(&layout, &[3, 4], 0.1651, pose, &truth);
         let views: Vec<View> = (0..3)
             .map(|_| View {
+                time: 0.0,
                 corners: corners.clone(),
                 pose,
                 tags: vec![3, 4],
@@ -1149,9 +1535,9 @@ mod tests {
             })
             .collect();
 
-        let calibration = calibrate(&views, assumed);
+        let calibration = measure_lens(&views, assumed, 8.0);
         assert!(
-            !calibration.measured,
+            !calibration.fitted,
             "measured {:.0}px, which is the edge of the range",
             calibration.intrinsics.fx
         );
@@ -1160,23 +1546,266 @@ mod tests {
 
     #[test]
     fn one_tag_cannot_measure_a_lens() {
-        // A single tag's four corners fit at every focal length, each with its
-        // own distance. Nothing in the picture says which is right, so the
-        // assumed value is kept rather than a number invented from noise.
+        // A fixed camera watching one tag: every sample holds the same four
+        // corners, and those four corners fit at every focal length, each with
+        // its own distance. Nothing in the picture says which is right, so the
+        // assumed value is kept and the band is reported as wide. (Frames of a
+        // *panning* camera do constrain the lens — the perspective across the
+        // tag changes while the centre does not — which is why the fit is joint
+        // rather than one frame's business.)
         let layout = test_layout(&[facing_tag(13, Vec3::new(15.5, 6.0, 0.5))]);
         let truth = Intrinsics::from_horizontal_fov(1280, 720, 60.0);
-        let pose = look_at(Vec3::new(11.0, 2.0, 4.0), Vec3::new(15.5, 6.0, 0.5));
-        let views = vec![View {
-            corners: corners_of(&layout, &[13], 0.1651, pose, &truth),
-            pose,
-            tags: vec![13],
-            lines: vec![],
-        }];
+        let position = Vec3::new(11.0, 2.0, 4.0);
+        let pose = look_at(position, Vec3::new(15.5, 6.0, 0.5));
+        let corners = corners_of(&layout, &[13], 0.1651, pose, &truth);
+        let views: Vec<View> = (0..3)
+            .map(|index| View {
+                time: index as f64 * 7.0,
+                corners: corners.clone(),
+                pose,
+                tags: vec![13],
+                lines: vec![],
+            })
+            .collect();
         let assumed = Intrinsics::from_horizontal_fov(1280, 720, 45.0);
-        let calibration = calibrate(&views, assumed);
+        let calibration = measure_lens(&views, assumed, 8.0);
         assert!(!calibration.measured, "one tag must not calibrate the lens");
         assert_eq!(calibration.intrinsics, assumed);
-        assert_eq!(calibration.frames, 0);
+        assert_eq!(calibration.frames, 3, "the fit used every frame it could");
+        let (low, high) = calibration
+            .range
+            .expect("the fit still says where it could be");
+        assert!(
+            high / low > 1.5,
+            "one tag narrowed the lens to {low:.0}–{high:.0}px, which it cannot"
+        );
+    }
+
+    #[test]
+    fn a_cluster_of_tags_does_not_pin_the_lens_at_broadcast_distance() {
+        // The Houston final's panes in miniature: two hub tags 35cm apart, both
+        // at the same height, seen from nineteen metres. Moving the camera back
+        // and lengthening the lens reproduces both almost exactly, so the band
+        // of lenses that explains the frames is wide. That is the fact the
+        // report exists to state — and the reason a position from those panes
+        // has to be read as a direction whose scale is uncertain.
+        let layout = TagLayout::load("2026-rebuilt-welded").expect("the bundled layout");
+        let first = layout.tag(8).expect("tag 8 is in the layout");
+        let second = layout.tag(9).expect("tag 9 is in the layout");
+        let normal = Mat3::from_quaternion(first.rotation).mul_vec(Vec3::new(1.0, 0.0, 0.0));
+        let position = first.translation + normal * 19.0 + Vec3::new(0.0, 0.0, 6.0);
+        let middle = (first.translation + second.translation) * 0.5;
+        let truth = Intrinsics::from_horizontal_fov(1280, 720, 70.0);
+        let mut seed = 7u32;
+        let views: Vec<View> = [-0.6, 0.0, 0.6]
+            .into_iter()
+            .enumerate()
+            .map(|(index, offset)| {
+                let pose = look_at(position, Vec3::new(middle.x, middle.y + offset, middle.z));
+                let mut corners = corners_of(&layout, &[8, 9], 0.1651, pose, &truth);
+                jitter(&mut corners, &mut seed);
+                View {
+                    time: index as f64 * 7.0,
+                    corners,
+                    pose,
+                    tags: vec![8, 9],
+                    lines: vec![],
+                }
+            })
+            .collect();
+        let assumed = Intrinsics::from_horizontal_fov(1280, 720, 60.0);
+        let calibration = measure_lens(&views, assumed, 8.0);
+        // Whatever the band is, it has to contain the lens the picture was
+        // drawn with: a report that excludes the truth is worse than one that
+        // admits it does not know.
+        if let Some((low, high)) = calibration.range {
+            assert!(
+                low <= truth.fx && truth.fx <= high,
+                "the lens the picture was drawn with ({:.0}px) is outside the reported {low:.0}–{high:.0}px",
+                truth.fx
+            );
+        }
+        // And two tags this close together at this distance must not be quoted
+        // as a measurement: the band they leave is several percent wide, which
+        // on a twenty-metre ray is metres of camera position.
+        assert!(
+            !calibration.measured
+                || calibration
+                    .range
+                    .is_some_and(|range| range.1 / range.0 < 1.02),
+            "a 35cm cluster at nineteen metres is not a lens: reported {:.0}px, band {:.0}–{:.0}px",
+            calibration.intrinsics.fx,
+            calibration.range.map_or(0.0, |range| range.0),
+            calibration.range.map_or(0.0, |range| range.1)
+        );
+    }
+
+    #[test]
+    fn a_bent_lens_is_fitted_only_when_the_picture_asks_for_one() {
+        // A broadcast long lens bends straight lines near the edge of the
+        // frame, and a tag sitting there lands where a pinhole says it cannot.
+        // No pose absorbs that: what separates the bend from a slightly
+        // different camera is the same tags seen at different distances from
+        // the principal point, which is what a pan gives.
+        // Tags across the width of the frame are what a lens bend shows up in:
+        // moving the outermost ones and not the middle is a shape no pose can
+        // reproduce, whereas a tight cluster is nearly a zoom of itself.
+        let layout = TagLayout::load("2026-rebuilt-welded").expect("the bundled layout");
+        let ids = [5u16, 8, 18, 27];
+        let base = Intrinsics::from_horizontal_fov(1280, 720, 60.0);
+        let bent = Intrinsics { k1: 0.12, ..base };
+        let position = Vec3::new(8.27, -9.0, 4.0);
+        let shots = |camera: &Intrinsics| -> Vec<View> {
+            [2.2, 3.4, 4.6]
+                .into_iter()
+                .enumerate()
+                .map(|(index, target)| {
+                    let pose = look_at(position, Vec3::new(8.27, target, 1.12));
+                    View {
+                        time: index as f64 * 7.0,
+                        corners: corners_of(&layout, &ids, 0.1651, pose, camera),
+                        pose,
+                        tags: ids.to_vec(),
+                        lines: vec![],
+                    }
+                })
+                .collect()
+        };
+
+        let fitted = measure_lens(&shots(&bent), base, 8.0);
+        assert!(
+            fitted.k1_measured,
+            "a 0.12 bend was left at k1 = {:.3}",
+            fitted.intrinsics.k1
+        );
+        assert!(
+            (fitted.intrinsics.k1 - 0.12).abs() < 0.06,
+            "fitted k1 = {:.3} against 0.12",
+            fitted.intrinsics.k1
+        );
+
+        // …and straight footage must not be given one, which is the half of the
+        // test that keeps the term from swallowing corner noise.
+        let plain = measure_lens(&shots(&base), base, 8.0);
+        assert!(
+            !plain.k1_measured,
+            "straight footage was bent by k1 = {:.3}",
+            plain.intrinsics.k1
+        );
+    }
+
+    #[test]
+    fn a_re_aimed_camera_is_two_shots_and_a_small_pan_is_one() {
+        // A pane is one camera, but it can be re-aimed between samples. The
+        // evidence is a tag both frames see: a few degrees of pan leaves it
+        // where it was to within a hundred pixels, and is one shot; a re-aim
+        // throws it across the frame, and averaging the two positions would put
+        // the camera between them.
+        let layout = test_layout(&[facing_tag(3, Vec3::new(6.0, 6.0, 0.5))]);
+        let camera = Intrinsics::from_horizontal_fov(1280, 720, 60.0);
+        let position = Vec3::new(2.0, 1.0, 4.0);
+        let at = |degrees: f64, time: f64| {
+            let level = look_at(position, Vec3::new(6.0, 6.0, 0.5));
+            // A yaw is a rotation of the *field* frame, so it multiplies the
+            // field-to-camera rotation on the right; on the left it would roll
+            // the camera about its own optical axis and barely move the tag.
+            let turned = Mat3::from_quaternion(level.rotation)
+                .mul_mat(&Mat3::from_axis_angle(
+                    Vec3::new(0.0, 0.0, 1.0),
+                    degrees.to_radians(),
+                ))
+                .to_quaternion();
+            let pose = CameraPose {
+                position,
+                rotation: turned,
+            };
+            View {
+                time,
+                corners: corners_of(&layout, &[3], 0.1651, pose, &camera),
+                pose,
+                tags: vec![3],
+                lines: vec![],
+            }
+        };
+        let views = vec![at(-2.0, 0.0), at(2.0, 7.0), at(40.0, 14.0)];
+        let split = shots(&views, &camera);
+        assert_eq!(
+            split,
+            vec![0..2, 2..3],
+            "four degrees of pan is one shot and a forty-degree re-aim is not"
+        );
+    }
+
+    #[test]
+    fn a_long_gap_with_no_tag_in_common_is_a_new_shot() {
+        // Two samples thirty seconds apart that share no tag have nothing in
+        // the picture to say whether the camera moved, so they are not treated
+        // as one shot: a station is evidence about one place, and this is the
+        // case where the evidence is missing rather than absent-mindedly
+        // assumed. Ten seconds apart is a different matter.
+        let layout = test_layout(&[
+            facing_tag(3, Vec3::new(6.0, 6.0, 0.5)),
+            facing_tag(4, Vec3::new(9.0, 6.0, 0.5)),
+        ]);
+        let camera = Intrinsics::from_horizontal_fov(1280, 720, 60.0);
+        let position = Vec3::new(2.0, 1.0, 4.0);
+        let view = |id: u16, time: f64| {
+            let pose = look_at(position, layout.tag(id).expect("tag").translation);
+            View {
+                time,
+                corners: corners_of(&layout, &[id], 0.1651, pose, &camera),
+                pose,
+                tags: vec![id],
+                lines: vec![],
+            }
+        };
+        let close = vec![view(3, 0.0), view(4, 10.0)];
+        assert_eq!(shots(&close, &camera), vec![0..2]);
+        let apart = vec![view(3, 0.0), view(4, 30.0)];
+        assert_eq!(shots(&apart, &camera), vec![0..1, 1..2]);
+    }
+
+    #[test]
+    fn the_busiest_shot_is_the_one_the_station_is_fitted_from() {
+        let layout = TagLayout::load("2026-rebuilt-welded").expect("the bundled layout");
+        let camera = Intrinsics::from_horizontal_fov(1280, 720, 60.0);
+        let position = Vec3::new(12.0, -8.0, 5.0);
+        let view = |id: u16, time: f64, target: Vec3| {
+            let pose = look_at(position, target);
+            View {
+                time,
+                corners: corners_of(&layout, &[id], 0.1651, pose, &camera),
+                pose,
+                tags: vec![id],
+                lines: vec![],
+            }
+        };
+        let long = layout.tag(5).expect("tag").translation;
+        let short = layout.tag(18).expect("tag").translation;
+        // The two halves share no tag, so only the clock can tell them apart.
+        let views = vec![
+            view(5, 0.0, long),
+            view(5, 7.0, long),
+            view(5, 14.0, long),
+            view(18, 44.0, short),
+            view(18, 51.0, short),
+        ];
+        let split = shots(&views, &camera);
+        assert_eq!(split.len(), 2, "{split:?}");
+        assert_eq!(busiest_shot(&views, &split), 0..3);
+    }
+
+    /// Deterministic corner noise, of the size a broadcast codec leaves: about
+    /// a third of a pixel, which on a nine-pixel tag is a large fraction of it.
+    fn jitter(corners: &mut [Correspondence], seed: &mut u32) {
+        let mut noise = || {
+            *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((*seed >> 8) as f64 / (1u32 << 24) as f64) - 0.5
+        };
+        for corner in corners.iter_mut() {
+            corner.image.0 += noise() * 0.8;
+            corner.image.1 += noise() * 0.8;
+        }
     }
 
     #[test]
@@ -1204,6 +1833,7 @@ mod tests {
             }
             let solution = solve::refine(truth, &corners, &camera).expect("solves");
             views.push(View {
+                time: 0.0,
                 corners,
                 pose: solution.pose,
                 tags: vec![3, 4],
@@ -1219,6 +1849,7 @@ mod tests {
             corner.image.1 += noise();
         }
         views.push(View {
+            time: 0.0,
             corners: stray,
             pose: elsewhere,
             tags: vec![3, 4],
@@ -1247,6 +1878,7 @@ mod tests {
         let views: Vec<View> = [first, first, first, second, second]
             .into_iter()
             .map(|pose| View {
+                time: 0.0,
                 corners: corners_of(&layout, &[3, 4], 0.1651, pose, &camera),
                 pose,
                 tags: vec![3, 4],
@@ -1270,6 +1902,7 @@ mod tests {
         let views: Vec<View> = [first, first, first, distant, distant]
             .into_iter()
             .map(|pose| View {
+                time: 0.0,
                 corners: corners.clone(),
                 pose,
                 tags: vec![3],
@@ -1288,6 +1921,7 @@ mod tests {
         let pose = look_at(Vec3::new(11.0, 2.0, 4.0), Vec3::new(15.5, 6.0, 0.5));
         let corners = corners_of(&layout, &[13], 0.1651, pose, &camera);
         let views = vec![View {
+            time: 0.0,
             corners,
             pose,
             tags: vec![13],

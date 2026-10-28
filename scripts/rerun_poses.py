@@ -584,8 +584,6 @@ def log_station(camera: Camera) -> None:
                 [[float(value) for value in ptz["position"]]],
                 colors=[(120, 255, 140)],
                 radii=0.1,
-                labels=[f"{camera.name} fixed position: {len(ptz['frames'])} frames, "
-                        f"{ptz['model_frames']} model-matched, rms {float(ptz['rms_px']):.1f}px"],
             ),
             static=True,
         )
@@ -599,10 +597,6 @@ def log_station(camera: Camera) -> None:
             [position],
             colors=[(255, 200, 90)],
             radii=0.08,
-            labels=[
-                f"{camera.name} station: {station['frames_used']} frame(s), "
-                f"rms {float(station['rms_px']):.1f}px"
-            ],
         ),
         static=True,
     )
@@ -617,7 +611,9 @@ def log_rivals(camera: Camera) -> list[str]:
     belongs to, one marker per distinct place, so that "this pose does not match
     the model" can be looked at rather than argued about: the reported pose and
     the pose the footage actually supports are usually at opposite corners of the
-    field. The reason the report gives is the marker's label.
+    field. The reason the report gives goes to the terminal; the marker is bare,
+    because a sentence pinned to every one of them buries the field it is drawn
+    on.
     """
     places: dict[tuple[float, float, float], list] = {}
     for frame in camera.solved:
@@ -645,11 +641,6 @@ def log_rivals(camera: Camera) -> list[str]:
             [list(place[0]) for place in ordered],
             colors=[(255, 120, 120)],
             radii=0.09,
-            labels=[
-                f"{camera.name}: also fits {place[2]} frame(s) from "
-                f"({place[0][0]:.1f}, {place[0][1]:.1f}, {place[0][2]:.1f})m — {place[1]}"
-                for place in ordered
-            ],
         ),
         static=True,
     )

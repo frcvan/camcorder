@@ -516,6 +516,9 @@ fn pose_from_tag(
 
     // H = K [r1 r2 t] up to scale.
     let inverse_focal = Mat3::from_rows([
+        // The initial guess only. Distortion is left out here on purpose: this
+        // homography exists to give the refinement somewhere to start, and the
+        // refinement projects through the full model, radial term included.
         [1.0 / camera.fx, 0.0, -camera.cx / camera.fx],
         [0.0, 1.0 / camera.fy, -camera.cy / camera.fy],
         [0.0, 0.0, 1.0],
@@ -731,7 +734,28 @@ fn damping(lambda: f64, entry: f64, scale: f64) -> f64 {
     lambda * entry.abs().max(scale * 1e-6).max(1e-12)
 }
 
+/// Jointly refine a shared camera centre with each frame's orientation and its
+/// own zoom. A camera that zoomed between frames is allowed to have done so.
 pub(crate) fn refine_ptz(views: &[PtzView], fixed_position: bool) -> Option<Vec<PtzView>> {
+    refine_ptz_with(views, fixed_position, true)
+}
+
+/// The same fit with the lens held at whatever every view was handed.
+///
+/// This is how the lens is measured: the focal length stops being one frame's
+/// private scale and becomes a shared unknown of the whole station, so all the
+/// frames have to get their geometry right with one of it. Fitting a band of
+/// candidate lenses this way is what makes a residual say something about the
+/// lens rather than about one frame's own zoom.
+pub(crate) fn refine_ptz_pinned(views: &[PtzView], fixed_position: bool) -> Option<Vec<PtzView>> {
+    refine_ptz_with(views, fixed_position, false)
+}
+
+fn refine_ptz_with(
+    views: &[PtzView],
+    fixed_position: bool,
+    free_zoom: bool,
+) -> Option<Vec<PtzView>> {
     if views.is_empty() || views.iter().any(|view| view.corners.len() < 4) {
         return None;
     }
@@ -859,8 +883,15 @@ pub(crate) fn refine_ptz(views: &[PtzView], fixed_position: bool) -> Option<Vec<
             };
             // A focal-length step of e^2 would be a different lens, not a
             // refinement: clamp it and let the cost decide, rather than throwing
-            // the whole fit away over one frame's wild step.
-            let focal_step = step[3].clamp(-0.5, 0.5);
+            // the whole fit away over one frame's wild step. A pinned lens takes
+            // no focal step at all: the column is still in the system, so the
+            // rotation steps account for it, and the value it would have moved
+            // to is simply not taken.
+            let focal_step = if free_zoom {
+                step[3].clamp(-0.5, 0.5)
+            } else {
+                0.0
+            };
             step_size +=
                 step[0] * step[0] + step[1] * step[1] + step[2] * step[2] + focal_step * focal_step;
             let rotation = delta_rotation_vector([step[0], step[1], step[2]])

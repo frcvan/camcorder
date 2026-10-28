@@ -254,7 +254,14 @@ impl Quat {
     }
 }
 
-/// Pinhole camera intrinsics, in pixels.
+/// Pinhole camera intrinsics, in pixels, with one radial distortion term.
+///
+/// `k1` is not decoration. A broadcast long lens bends straight lines by a few
+/// pixels near the edges of the frame, and the tags a small pane can read are
+/// often the ones furthest from its centre — so a pinhole-only fit leaves a
+/// systematic residual that no pose can absorb, and bottoms out around a pixel
+/// on footage whose corner noise is a fifth of that. It is zero by default, and
+/// a fit only keeps a non-zero value when the picture asks for one.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Intrinsics {
     pub fx: f64,
@@ -263,6 +270,9 @@ pub struct Intrinsics {
     pub cy: f64,
     pub width: u32,
     pub height: u32,
+    /// First radial distortion coefficient (Brown–Conrady), dimensionless:
+    /// a ray at normalised radius `r` lands where `r * (1 + k1 * r²)` does.
+    pub k1: f64,
 }
 
 impl Intrinsics {
@@ -277,17 +287,25 @@ impl Intrinsics {
             cy: (height as f64 - 1.0) * 0.5,
             width,
             height,
+            k1: 0.0,
         }
     }
 
     /// Project a point in camera coordinates (x right, y down, z forward).
+    ///
+    /// The radial term is applied in normalised coordinates, before the focal
+    /// length, which is the Brown–Conrady convention: it moves a pixel along the
+    /// ray from the principal point and leaves the centre of the frame alone.
     pub fn project(&self, point: Vec3) -> Option<(f64, f64)> {
         if point.z <= 1e-9 {
             return None;
         }
+        let x = point.x / point.z;
+        let y = point.y / point.z;
+        let radial = 1.0 + self.k1 * (x * x + y * y);
         Some((
-            self.fx * point.x / point.z + self.cx,
-            self.fy * point.y / point.z + self.cy,
+            self.fx * x * radial + self.cx,
+            self.fy * y * radial + self.cy,
         ))
     }
 }
@@ -426,5 +444,36 @@ mod tests {
         assert!((centre.0 - k.cx).abs() < 1e-9);
         assert!((centre.1 - k.cy).abs() < 1e-9);
         assert!(k.project(Vec3::new(0.0, 0.0, -1.0)).is_none());
+        // No distortion by default: the extra field must not quietly move the
+        // pinhole the whole subsystem was built on.
+        assert_eq!(k, Intrinsics { k1: 0.0, ..k });
+    }
+
+    #[test]
+    fn radial_distortion_bends_the_picture_away_from_its_centre() {
+        // A broadcast lens is not a pinhole, and the tags a small pane can read
+        // sit off-centre: the middle of the frame must stay exactly where it
+        // was, and a point a third of the way to the edge must move along its
+        // own ray — outward for barrel, inward for pincushion — in proportion
+        // to the cube of the radius, which is what the one-term model means.
+        let plain = Intrinsics::from_horizontal_fov(1920, 1080, 60.0);
+        let barrel = Intrinsics { k1: 0.2, ..plain };
+        let pincushion = Intrinsics { k1: -0.2, ..plain };
+
+        let centre = Vec3::new(0.0, 0.0, 1.0);
+        assert_eq!(plain.project(centre), barrel.project(centre));
+
+        // `r = 1/3` of the focal length off axis, so `r² = 1/9` and the radial
+        // factor is `1 + k1/9`.
+        let point = Vec3::new(1.0 / 3.0, 0.0, 1.0);
+        let flat = plain.project(point).expect("in front");
+        let bent = barrel.project(point).expect("in front");
+        let pinched = pincushion.project(point).expect("in front");
+        assert!((bent.0 - flat.0 - plain.fx / 3.0 * 0.2 / 9.0).abs() < 1e-9);
+        assert!(pinched.0 < flat.0 && bent.0 > flat.0);
+        assert!(
+            (bent.1 - flat.1).abs() < 1e-9,
+            "no vertical bend on the axis"
+        );
     }
 }

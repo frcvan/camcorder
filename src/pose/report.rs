@@ -305,6 +305,22 @@ pub struct PtzStationReport {
     pub frames_unexplained: usize,
     /// Whether the centre is too loosely determined to be read as a position.
     pub ambiguous: bool,
+    /// The shared focal length the station was fitted with, pixels.
+    pub focal_px: f64,
+    /// Whether the footage pins that focal length. A position solved through an
+    /// unpinned lens is the right shape at the wrong scale, which is why the
+    /// two are reported together.
+    pub focal_measured: bool,
+    /// Focal lengths the footage could not rule out, pixels. `None` when no
+    /// lens fit was possible; the low and high ends are the edges of the search
+    /// range when even those were not ruled out.
+    pub focal_range_px: Option<[f64; 2]>,
+    /// Radial distortion fitted with the lens, 0 when the frames did not ask
+    /// for one.
+    pub k1: f64,
+    /// Shots the pane was split into. A camera that was re-aimed between
+    /// samples is more than one; the station describes the busiest.
+    pub shots: usize,
     pub frames: Vec<PtzFrameReport>,
 }
 
@@ -341,8 +357,25 @@ impl PtzStationReport {
                 self.line_samples
             ),
         };
+        // The lens is part of the answer, not a footnote: every distance from
+        // this camera is scaled by it, so a position quoted next to an unpinned
+        // focal length is a direction with a guessed unit.
+        let lens = if self.focal_measured {
+            format!("lens {:.0}px", self.focal_px)
+        } else if let Some([low, high]) = self.focal_range_px {
+            format!(
+                "lens {:.0}px, itself only bounded to {:.0}–{:.0}px",
+                self.focal_px, low, high
+            )
+        } else {
+            format!("lens assumed, {:.0}px", self.focal_px)
+        };
+        let shots = match self.shots {
+            0 | 1 => String::new(),
+            count => format!(", {count} shots in this pane"),
+        };
         format!(
-            "fixed position ({evidence}, {structure}, rms {:.1}px, {bound}): ({:.2}, {:.2}, {:.2})m",
+            "fixed position ({evidence}{shots}, {structure}, {lens}, rms {:.1}px, {bound}): ({:.2}, {:.2}, {:.2})m",
             self.rms_px, self.position[0], self.position[1], self.position[2]
         )
     }

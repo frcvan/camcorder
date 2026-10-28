@@ -18,14 +18,15 @@
 //! - [`side`]: which end of the field the frame is looking at.
 //! - [`report`]: the result, as text or JSON.
 //!
-//! The estimate runs in three passes over the sampled frames, and each one
+//! The estimate runs in four passes over the sampled frames, and each one
 //! exists because the previous one could not know something:
 //!
 //! 1. read every frame, so the frames can vote on which tag ids are real;
-//! 2. solve every frame against the assumed lens, so the frames with two tags
-//!    can measure the lens;
-//! 3. solve every frame again against the measured lens, then fit one pose to
-//!    the whole station.
+//! 2. solve every frame against the assumed lens, and segment the pane into
+//!    shots, so the lens is fitted across frames that really share a camera;
+//! 3. solve every frame again through the fitted lens — measured or merely
+//!    fitted, with the band it leaves reported either way;
+//! 4. fit one pose to the busiest shot, the camera having held still for it.
 //!
 //! Everything else in the crate can be changed without touching this, and this
 //! can be lifted into its own binary by keeping these modules together.
@@ -301,6 +302,7 @@ impl Judge<'_> {
             };
 
             evaluated.views.push(station::View {
+                time: frame.time,
                 corners: solve::correspondences(
                     &frame.detections,
                     self.layout,
@@ -451,8 +453,9 @@ pub fn estimate(video: &Path, options: &PoseOptions) -> Result<PoseReport> {
     }
     tags_seen.sort_unstable();
 
-    // Pass three: solve against the assumed lens, measure the lens from the
-    // frames that can, then solve again with what was measured.
+    // Pass three: solve against the assumed lens, find the shot the camera
+    // spent the file in, then measure the lens from that shot's frames as one
+    // shared unknown rather than one frame at a time.
     let judge = Judge {
         layout: &layout,
         camera: &assumed,
@@ -463,26 +466,38 @@ pub fn estimate(video: &Path, options: &PoseOptions) -> Result<PoseReport> {
         patterns: &patterns,
     };
     let provisional = judge.evaluate(&prepared, &sampled);
-    let calibration = station::calibrate(&provisional.views, assumed);
+    let provisional_shots = station::shots(&provisional.views, &assumed);
+    let lens_shot = station::busiest_shot(&provisional.views, &provisional_shots);
+    let calibration =
+        station::measure_lens(&provisional.views[lens_shot], assumed, options.max_rms_px);
 
-    let calibrated;
-    let mut evaluated = if calibration.measured {
-        calibrated = Judge {
+    // Solve again with what was measured. The lens can move without being
+    // pinned — on a pane whose tags stand in a cluster it moves a long way on a
+    // shallow residual — and that fit still has to be the one the rows report.
+    let mut evaluated = if calibration.intrinsics != assumed {
+        Judge {
             layout: &layout,
             camera: &calibration.intrinsics,
             pane,
             support: &support,
             options,
-            calibrated: true,
+            calibrated: calibration.measured,
             patterns: &patterns,
-        };
-        calibrated.evaluate(&prepared, &sampled)
+        }
+        .evaluate(&prepared, &sampled)
     } else {
         provisional
     };
 
+    // A pane can hold more than one shot. The shared position belongs to the
+    // shot the camera spent the file in; the frames of any other keep the poses
+    // their own solve gave them, because the camera did move between the two.
+    let shots = station::shots(&evaluated.views, &calibration.intrinsics);
+    let shot = station::busiest_shot(&evaluated.views, &shots);
+    let shot_views: Vec<station::View> = evaluated.views[shot.clone()].to_vec();
+
     let station = station::fit(
-        &evaluated.views,
+        &shot_views,
         &calibration.intrinsics,
         &layout,
         options.max_rms_px,
@@ -509,7 +524,7 @@ pub fn estimate(video: &Path, options: &PoseOptions) -> Result<PoseReport> {
     // the structure can only be looked for once there is a pose to project it
     // from. Each later round starts from the pose the previous one fitted, so its
     // search window can be tighter and a match cannot be to a nearby stranger.
-    let ptz_views = evaluated.views.clone();
+    let ptz_views = shot_views.clone();
     let mut ptz_station = station::fit_ptz(
         &ptz_views,
         &calibration.intrinsics,
@@ -533,7 +548,7 @@ pub fn estimate(video: &Path, options: &PoseOptions) -> Result<PoseReport> {
             {
                 let Some(frame) = sampled
                     .iter()
-                    .find(|frame| frame.time == evaluated.frames[index].time)
+                    .find(|frame| frame.time == evaluated.frames[shot.start + index].time)
                 else {
                     continue;
                 };
@@ -575,14 +590,16 @@ pub fn estimate(video: &Path, options: &PoseOptions) -> Result<PoseReport> {
         }
     }
 
-    // One camera filmed this file, so every row carries the centre that was
-    // fitted for it. A frame whose own solve landed on the other side of the
+    // Every row of the shot the camera held still in carries the centre that
+    // was fitted for it. A frame whose own solve landed on the other side of the
     // wall — which a lone tag allows, and which happened on Orlando — would
     // otherwise be drawn from somewhere the camera never was, and the side of
-    // the field read from it would be read from the wrong end.
+    // the field read from it would be read from the wrong end. Frames of another
+    // shot keep their own poses: the camera really did move between the two.
     if let Some(fitted) = &ptz_station {
         let (frames, views) = (&mut evaluated.frames, &evaluated.views);
-        for (index, (pose, frame_camera)) in fitted.views.iter().enumerate() {
+        for (offset, (pose, frame_camera)) in fitted.views.iter().enumerate() {
+            let index = shot.start + offset;
             let (Some(row), Some(view)) = (frames.get_mut(index), views.get(index)) else {
                 break;
             };
@@ -646,10 +663,15 @@ pub fn estimate(video: &Path, options: &PoseOptions) -> Result<PoseReport> {
         frames_stray: fitted.frames_stray,
         frames_unexplained: fitted.frames_unexplained,
         ambiguous: fitted.ambiguous,
+        focal_px: calibration.intrinsics.fx,
+        focal_measured: calibration.measured,
+        focal_range_px: calibration.range.map(|(low, high)| [low, high]),
+        k1: calibration.intrinsics.k1,
+        shots: shots.len(),
         frames: fitted
             .views
             .iter()
-            .zip(&evaluated.frames)
+            .zip(&evaluated.frames[shot.clone()])
             .map(|((pose, camera), frame)| report::PtzFrameReport {
                 time: frame.time,
                 rotation: [

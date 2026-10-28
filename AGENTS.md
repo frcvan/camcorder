@@ -9,7 +9,7 @@ camera was from the AprilTags in the picture.
 | what | command |
 | --- | --- |
 | build | `cargo build --release` |
-| test everything | `cargo test` (127 tests: 112 unit, 3 CLI, 5 pose pipeline, 7 video pipeline) |
+| test everything | `cargo test` (134 tests: 118 unit, 3 CLI, 6 pose pipeline, 7 video pipeline) |
 | one area | `cargo test --lib pose` / `cargo test --test views_pipeline` |
 | lint | `cargo clippy --all-targets` |
 | format | `rustfmt --edition 2021 <files you touched>` |
@@ -118,21 +118,35 @@ the cells against its twin's 56%. The mount check counts only samples more than 
 because the parts of the mount that lie in that plane project to the same pixels
 for both answers and would only add a constant to the score.
 
-**The lens is measured, not assumed.** `--fov` is only a seed. Two tags a known
-distance apart fix the focal length from the picture itself, and a frame that
-fits better at some other focal length says so; the median across frames is used
-and every frame is re-solved with it. A single tag can never do this — that is
-exactly why its pose is scaled by whatever focal length you assumed. Two guards
-keep the measurement honest, and both were added after real footage broke it:
-**one frame never sets the lens** (a single pane frame holding two tags 36 cm
-apart "measured" 50% below the guess, halving every distance in the video and
-putting the camera at knee height inside the field), and **a minimum sitting on
-the edge of the search range is not a measurement** — the search ran out of room,
-so the number is the bound rather than anything the picture said. On broadcast
-panes the tags are 15–17 px wide, which leaves the scale genuinely uncertain:
-sweeping the focal from 400px to 1000px moves the camera 2–3 m with the
-reprojection flat at 0.25–0.35 px. Trust the direction and the side reading from
-that footage, not the metres.
+**The lens is fitted once per shot, and reported as a band.** `--fov` is only a
+seed. `station::measure_lens` fits one shared focal length to every frame of the
+busiest shot at once — one centre, a rotation per frame — and reports both the
+fit and the band of lenses that explains the frames just as well. It is a grid
+first and a golden section second, because the residual is not convex in focal
+length; `k1` and a pixel aspect are offered next and kept only if they explain
+the frames by 10%, and neither may sit on the edge of its range, where the number
+is the clamp rather than the picture. `measured` means the band is worth less
+than half a metre of camera position — the band's width times the distance to the
+tags — because a ratio alone cannot say that: 5% of 1800 px is 10 cm at a metre
+and 1.5 m at thirty. The guess is kept unless the fit pins the lens or explains
+the frames by 25% better.
+
+Two guards were added after real footage broke the old per-frame measurement, and
+both survive in the joint fit: **one frame never sets the lens** (a single pane
+frame holding two tags 36 cm apart "measured" 50% below the guess, halving every
+distance in the video and putting the camera at knee height inside the field),
+and **a minimum sitting on the edge of the search range is not a measurement**.
+A shot whose frames disagree so badly that no lens reprojects them within
+`--max-rms` has no lens at all, rather than a compromise that looks like one.
+
+On the 2026 field the tags are clustered 35 cm apart, which at twenty metres is
+no baseline. The Houston final's panes come back fitted but **not pinned** — one
+overview pane allows 1057–1352 px, worth 2.3 m of camera position — and the
+report says so in `focal_measured`, `focal_range_px` and `focal_source`. A single
+tag seen from a fixed camera pins nothing; the same tag seen while the camera
+panned does constrain the lens (the perspective across it changes and the centre
+does not), which is one reason the fit is joint. Trust the direction and the side
+reading from that footage, not the metres.
 
 **The check is the model's own geometry, not a detector.** Nothing here
 recognises a trench or a ladder in the picture. The model knows where the mount
@@ -153,6 +167,8 @@ report: a camera that really panned has to keep showing as having panned.
 an 8 m-wide field are correct broadcast camera positions, not bugs. Underground
 (z < 0) is the impossible one, and the gates reject it: a frame whose only solve
 is impossible is reported in `missed` with the reason rather than in `solved`.
+
+**A pane can hold more than one shot.** A file is one pane of the broadcast frame, and a pane is one camera, but it can be re-aimed between samples. `station::shots` splits the samples where a tag both of them see has moved a tenth of the frame across, or where samples more than 20 s apart share no tag to compare; the shared position is then fitted from the busiest shot, counted by the frames whose own solve agrees on a centre. A pan is not a new shot — the fit lets every frame keep its own rotation — while a re-aim is, and the frames of the other shot keep the poses their own solves gave them. On the Houston panes the whole file is one shot, which is the control: nothing there should move when this changes.
 
 **One frame must not move the camera.** A lone tag solves two ways — the camera
 in front of it, and a camera on the far side of the wall — and which one a frame

@@ -309,6 +309,55 @@ fn encode(dir: &Path, name: &str, rgb: &[u8], filter: Option<&str>) -> PathBuf {
     out
 }
 
+/// Encode a sequence of frames as a clip, one frame each at `fps` — the way a
+/// pane that was re-aimed halfway through actually arrives, rather than a still
+/// repeated for its whole length.
+fn encode_sequence(dir: &Path, name: &str, frames: &[Vec<u8>], fps: usize) -> PathBuf {
+    let raw = dir.join(format!("{name}.rgb"));
+    let mut bytes = Vec::with_capacity(frames.len() * WIDTH * HEIGHT * 3);
+    for frame in frames {
+        assert_eq!(
+            frame.len(),
+            WIDTH * HEIGHT * 3,
+            "every frame has to be {WIDTH}x{HEIGHT} rgb"
+        );
+        bytes.extend_from_slice(frame);
+    }
+    std::fs::write(&raw, bytes).expect("write the raw frames");
+    let out = dir.join(name);
+    let output = Command::new(camcorder::video::BIN_FFMPEG)
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+        ])
+        .arg(format!("{WIDTH}x{HEIGHT}"))
+        .args(["-r", &fps.to_string(), "-i"])
+        .arg(&raw)
+        .args([
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&out)
+        .output()
+        .expect("ffmpeg is required to build these fixtures");
+    assert!(
+        output.status.success(),
+        "encoding {name} failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    out
+}
+
 fn options(preprocess: bool) -> PoseOptions {
     PoseOptions {
         tag_layout: "2026-rebuilt-welded".to_string(),
@@ -450,6 +499,48 @@ fn two_tags_measure_the_lens_the_run_was_told_wrong() {
             frame.confidence
         );
     }
+}
+
+#[test]
+fn a_pane_that_was_re_aimed_reports_two_shots_and_fits_one() {
+    // One pane, two framings: six seconds aimed at tag 13, then six at tag 14
+    // forty centimetres along the same wall — a re-aim of a couple of hundred
+    // pixels, which is what a camera being moved between shots looks like.
+    // Fitting one centre to both would put the camera between two places it
+    // never was, so the report has to say the pane held two shots and fit the
+    // one the camera spent the time in.
+    let sandbox = Sandbox::new();
+    let camera = Intrinsics::from_horizontal_fov(WIDTH as u32, HEIGHT as u32, TRUTH_FOV);
+    // Both tags are in both framings; it is the aim that moves, which is what
+    // lets the shot split see the same tag in two places.
+    let first = render_scene(&[13, 14], truth_pose(&[13]), &camera, GREY, CLEAN_INK);
+    let second = render_scene(&[13, 14], truth_pose(&[14]), &camera, GREY, CLEAN_INK);
+    let frames: Vec<Vec<u8>> = std::iter::repeat_n(first, 180)
+        .chain(std::iter::repeat_n(second, 180))
+        .collect();
+    let video = encode_sequence(sandbox.dir.path(), "seg01_view2.mp4", &frames, 30);
+
+    let sample_more = PoseOptions {
+        samples: 4,
+        ..options(true)
+    };
+    let report = pose::estimate(&video, &sample_more).expect("the estimate runs");
+    let ptz = report
+        .ptz_station
+        .as_ref()
+        .expect("each shot is a fixed camera");
+    assert_eq!(
+        ptz.shots,
+        2,
+        "a pane re-aimed halfway through is two shots:\n{}",
+        report.render_table()
+    );
+    assert!(
+        ptz.frames.len() < report.solved.len(),
+        "the station must describe the busiest shot, not both: {} of {} frame(s)",
+        ptz.frames.len(),
+        report.solved.len()
+    );
 }
 
 #[test]
