@@ -8,9 +8,10 @@
 * the camera, as a pinhole plus a transform per solved frame, drawn at the
   frame's own lens — the focal length the pose was solved with, per frame when
   the pane zoomed — so the field model and the picture in the frustum agree;
-* the frame itself, at the same time, projected from that camera;
-* every frame of the video itself, decoded once and logged at the video's own
-  frame rate, so the picture and the plots run together;
+* every frame of the video itself, as a reference into the pane's own MP4 —
+  logged once as a `rr.AssetVideo` and decoded by the viewer — so the picture
+  and the plots run together at the video's own frame rate without a second,
+  lossy re-encode of every frame;
 * the camera's path, its height / heading / pitch / roll / residual and how
   much of a result each frame is over the timeline;
 * the one pose fitted to every frame of the station, and the focal length the
@@ -38,7 +39,6 @@ import json
 import math
 import subprocess
 import sys
-from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -57,11 +57,6 @@ TAG_THICKNESS_M = 0.005
 #: metres and this many degrees. A broadcast camera does not move during a
 #: match; two poses that differ by more are two cameras in the same video.
 STATION_ANGLE_TOLERANCE_DEG = 12.0
-#: `-q:v` for ffmpeg's mjpeg encoder, 2 (best) to 31 (smallest). A recording that
-#: holds every frame of a match needs the pictures compressed: a raw 1080p frame
-#: is 6MB, which is 60GB for ten minutes of 60fps footage, against a few tens of
-#: kilobytes for the same frame as a JPEG.
-JPEG_QUALITY = 6
 #: `side.alliance` and `side.tags_end` as numbers, so they can be plotted. Zero
 #: is "not read": an overview pane, or a picture with no coloured elements.
 ALLIANCE_CODE = {"blue": 1.0, "mixed": 2.0, "red": 3.0}
@@ -404,91 +399,6 @@ def video_times(video: Path) -> list[float]:
     return times
 
 
-def iter_video_jpegs(
-    video: Path, limit: int | None = None
-) -> Iterator[tuple[int, bytes]]:
-    """Every frame of the video, as `(index, JPEG bytes)`, decoded once.
-
-    One ffmpeg process for the whole file rather than a seek per frame: seeking
-    to each timestamp re-runs the decoder from the nearest keyframe, which for a
-    few thousand frames is minutes of work instead of seconds. ffmpeg does the
-    compression as it decodes, so the frames are handed over as the JPEGs the
-    recording will store rather than as raw pixels to compress here.
-    """
-    command = [
-        "ffmpeg",
-        "-hide_banner",
-        "-v",
-        "error",
-        "-nostdin",
-        "-i",
-        str(video),
-        "-an",
-        "-sn",
-        "-fps_mode",
-        "passthrough",
-        "-c:v",
-        "mjpeg",
-        "-q:v",
-        str(JPEG_QUALITY),
-        "-f",
-        "mjpeg",
-        "-",
-    ]
-    try:
-        process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
-        )
-    except FileNotFoundError:
-        print(
-            "warning: ffmpeg not found — logging poses without video", file=sys.stderr
-        )
-        return
-
-    # Start of image. Everything between one and the next is one JPEG: entropy
-    # coded data byte-stuffs any 0xFF it contains, so the marker cannot appear
-    # inside a frame.
-    soi = b"\xff\xd8\xff"
-    index = 0
-    buffer = bytearray()
-    try:
-        assert process.stdout is not None
-        while limit is None or index < limit:
-            chunk = process.stdout.read(1 << 20)
-            if not chunk:
-                break
-            buffer += chunk
-            while limit is None or index < limit:
-                start = buffer.find(soi)
-                if start < 0:
-                    break
-                following = buffer.find(soi, start + len(soi))
-                if following < 0:
-                    del buffer[:start]
-                    break
-                frame = bytes(buffer[start:following])
-                del buffer[:following]
-                if not frame.rstrip(b"\x00").endswith(b"\xff\xd9"):
-                    raise ValueError(f"{video}: incomplete JPEG frame {index}")
-                yield index, frame
-                index += 1
-        if limit is None or index < limit:
-            status = process.wait()
-            if status:
-                raise subprocess.CalledProcessError(status, command)
-            frame = bytes(buffer).rstrip(b"\x00")
-            if frame.startswith(soi) and frame.endswith(b"\xff\xd9"):
-                yield index, frame
-            elif frame:
-                raise ValueError(f"{video}: incomplete final JPEG frame")
-    finally:
-        if process.stdout is not None:
-            process.stdout.close()
-        if process.poll() is None:
-            process.kill()
-        process.wait()
-
-
 def log_frames(camera: Camera, cluster: list[dict], entity: str) -> None:
     """One camera station: where it stood, and what it saw while it stood there.
 
@@ -566,20 +476,41 @@ def log_video(
     entities: list[str],
     max_frames: int | None,
 ) -> None:
-    """Every frame of the video, at its own timestamp.
+    """Every frame of the video, from the encoded file itself.
 
     The report samples ten frames out of a match; logging only those leaves the
-    viewer with ten stills and a timeline that jumps. Decoding the file once and
-    logging every frame gives the recording the video's own frame rate, so the
-    camera's picture and its plots run together the way the footage did.
+    viewer with ten stills and a timeline that jumps. The pane's own MP4 goes in
+    once as a `rr.AssetVideo` and every frame is a `rr.VideoFrameReference` into
+    it, so the viewer decodes the picture at the video's own frame rate and the
+    camera's picture runs with its plots the way the footage did.
 
-    Images are assigned to an already-observed station by the nearest solved
+    What the recording holds is therefore the h264 stream rather than a second,
+    lossy re-encode of every frame: ten minutes of 1080p60 as JPEGs is tens of
+    gigabytes, against the few tens of megabytes of the file already on disk.
+    Nothing is decoded here — ffprobe supplies the timestamps, the viewer does
+    the rest — so there is no frame loop to make slow or to get out of step.
+
+    Frames are assigned to an already-observed station by the nearest solved
     frame. Before the first solve they are kept as unposed footage, rather than
     projecting them from an origin or pretending a future pose was measured.
     """
     if camera.video is None or not clusters:
         return
+    if camera.video.suffix.lower() != ".mp4":
+        # An asset video is an MP4 container, and the splitter writes MP4: a
+        # file from anywhere else would have to be re-encoded first, which is
+        # the cost this replaced. Say so instead of drawing nothing at all.
+        print(
+            f"warning: {camera.video}: only MP4 can be logged as a video asset — "
+            f"logging the poses without the picture",
+            file=sys.stderr,
+        )
+        return
     times = video_times(camera.video)
+    # One blob, referenced by every frame: the alternative — one picture per
+    # frame — is what made a match's recording tens of gigabytes.
+    asset = f"world/videos/{camera.name}"
+    rr.log(asset, rr.AssetVideo(path=str(camera.video)), static=True)
 
     def station_for(time: float) -> int | None:
         available = [
@@ -593,23 +524,20 @@ def log_video(
             key=lambda index: min(abs(time - float(frame["time"])) for frame in clusters[index]),
         )
 
-    logged = 0
-    for index, jpeg in iter_video_jpegs(camera.video, max_frames):
-        if index >= len(times):
-            raise ValueError(f"{camera.video}: more decoded frames than timestamps")
-        time = times[index]
+    limit = len(times) if max_frames is None else min(len(times), max(0, max_frames))
+    for time in times[:limit]:
         rr.set_time("video_time", duration=time)
         rr.set_time("frame", sequence=int(time * 1000))
         station = station_for(time)
         path = f"{entities[station]}/image" if station is not None else f"unposed/{camera.name}/image"
-        rr.log(path, rr.EncodedImage(contents=jpeg, media_type="image/jpeg"))
-        logged += 1
-        if logged % 600 == 0:
-            print(f"  {camera.name}: {logged} frame(s)…", file=sys.stderr)
-    expected = len(times) if max_frames is None else min(len(times), max(0, max_frames))
-    if logged != expected:
-        raise ValueError(f"{camera.video}: decoded {logged} frames, expected {expected}")
-    print(f"  {camera.name}: logged {logged} frame(s) of video", file=sys.stderr)
+        rr.log(path, rr.VideoFrameReference(seconds=time, video_reference=asset))
+    if limit != len(times):
+        print(
+            f"  {camera.name}: {limit} of {len(times)} frame(s) referenced "
+            f"(--max-frames)",
+            file=sys.stderr,
+        )
+    print(f"  {camera.name}: video asset logged once, {limit} frame(s) referenced", file=sys.stderr)
 
 
 def lens_note(camera: Camera) -> str | None:

@@ -421,7 +421,11 @@ and plots of position, height, heading, pitch, roll and reprojection error over
 the timeline. Each frustum is drawn at the lens its frame was solved with —
 `ptz_station.frames[].focal_px` when the pane zoomed, otherwise the report's
 `focal_px` — not at the `horizontal_fov_deg` guess rounded back into pixels, so
-the field model inside it is where the solve put it.
+the field model inside it is where the solve put it. The footage is not
+re-encoded: each pane's own MP4 is logged once as a video asset and every frame
+is a reference into it, so the viewer decodes the picture at the file's own
+frame rate and the recording stays the size of the footage rather than of a JPEG
+per frame.
 
 ```bash
 .venv/bin/python scripts/rerun_poses.py output/frc386/poses --rrd field.rrd
@@ -443,7 +447,7 @@ and the mirror solution a single tag allows is underground, not merely low.
 | `--rrd FILE` | write a recording (without it, `poses.rrd` in the cwd) |
 | `--spawn` | open the viewer when done |
 | `--no-video` | poses only: small and fast |
-| `--max-frames N` | at most N frames of video per camera — this is the file size |
+| `--max-frames N` | reference at most N frames of the video per camera (the asset is the whole file either way) |
 | `--min-height M` | hide frames below M metres (default 0) |
 | `--station-tolerance M` | poses within M metres are one fixed camera (default 1.5) |
 | `--layout-dir DIR`, `--tag-size M` | must match what `pose` used |
@@ -452,8 +456,8 @@ It reads the report's `tag_layout` from `assets/tags/`, so tags line up with
 what the solver used. `.venv/bin/rerun rrd verify FILE` checks a recording, and
 `.venv/bin/rerun rrd print FILE` is the honest check that the transforms and
 the pinholes are where you think they are: the camera transform belongs on the
-camera entity with the `Pinhole` and the image on its child, or the frustum
-draws at the origin pointing up.
+camera entity with the `Pinhole` and the `VideoFrameReference`s on its child, or
+the frustum draws at the origin pointing up.
 
 The markers carry no sentences: the per-station text labels were removed because
 they buried the 3D view. The reasons are printed when the recording is built and
@@ -473,7 +477,7 @@ every number is in the pose JSON.
 | every frame lands in `missed` | layout mismatch, or the video is not that season's field |
 | positions mirror across the wall | almost always a tag-frame/layout mismatch, not a solve bug |
 | only absurd positions survive | tags are being misread; raise `--min-confidence` and see what is left |
-| `.rrd` is enormous | it is the video: cut `--max-frames`, shorten `--window`, or use `--no-video` |
+| `.rrd` is enormous | it holds the source video: a long pane is a long file, so use `--no-video` for poses only |
 | frusta at the origin pointing up | the transform was logged below the pinhole; use this repo's script |
 | `rerun` not found | it is `.venv/bin/rerun`, not on `PATH` |
 

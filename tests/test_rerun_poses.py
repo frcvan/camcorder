@@ -63,26 +63,62 @@ class VideoTimelineTests(unittest.TestCase):
                 check=True,
             )
             times = poses.video_times(video)
-            frames = list(poses.iter_video_jpegs(video))
             self.assertEqual(len(times), 5)
-            self.assertEqual(len(frames), 5)
             self.assertAlmostEqual(times[0], 0.0)
             self.assertAlmostEqual(times[2], 0.8)
             self.assertAlmostEqual(times[-1], 1.2)
-            self.assertTrue(all(image.endswith(b"\xff\xd9") for _, image in frames))
-            self.assertEqual(len(list(poses.iter_video_jpegs(video, 2))), 2)
+
+            # Ten minutes of 1080p60 as one JPEG per frame is tens of gigabytes,
+            # so the file goes in once and each frame is a reference into it.
+            # The fixture is also the check that references carry the video's
+            # own presentation times, VFR gaps included: a picture at the wrong
+            # time is a picture of a different moment than its pose.
+            assets, references = [], []
+
+            def record_asset(**kwargs):
+                assets.append(kwargs)
+                return kwargs
+
+            def record_reference(**kwargs):
+                references.append(kwargs)
+                return kwargs
 
             camera = poses.Camera("test", {}, video, None)
             clusters = [[{"time": 0.0}, {"time": 1.2}], [{"time": 0.9}]]
-            with patch.object(poses.rr, "set_time") as set_time, patch.object(poses.rr, "log") as log:
+            with patch.object(poses.rr, "set_time") as set_time, \
+                 patch.object(poses.rr, "log") as log, \
+                 patch.object(poses.rr, "AssetVideo", record_asset), \
+                 patch.object(poses.rr, "VideoFrameReference", record_reference):
                 poses.log_video(camera, clusters, ["first", "second"], None)
-            self.assertEqual([call.args[0] for call in log.call_args_list], [
+
+            asset, *frames = log.call_args_list
+            self.assertEqual(asset.args[0], "world/videos/test")
+            self.assertEqual(asset.args[1]["path"], str(video))
+            self.assertTrue(asset.kwargs.get("static"), "the blob is logged once")
+            self.assertEqual(len(assets), 1, "the file must not be re-encoded per frame")
+            self.assertEqual(len(references), 5, "every video frame is a reference")
+            self.assertEqual(
+                [reference["video_reference"] for reference in references],
+                ["world/videos/test"] * 5,
+            )
+            self.assertEqual([reference["seconds"] for reference in references], times)
+            self.assertEqual([call.args[0] for call in frames], [
                 "first/image", "first/image", "first/image", "second/image", "first/image"
             ])
             duration_calls = [call.kwargs["duration"] for call in set_time.call_args_list if call.args[0] == "video_time"]
             self.assertEqual(duration_calls, times)
             frame_calls = [call.kwargs["sequence"] for call in set_time.call_args_list if call.args[0] == "frame"]
             self.assertEqual(frame_calls, [int(time * 1000) for time in times])
+
+            # `--max-frames` cuts references, never the asset: the file is the
+            # recording's size, and it is in there once either way.
+            references.clear()
+            with patch.object(poses.rr, "set_time"), \
+                 patch.object(poses.rr, "log"), \
+                 patch.object(poses.rr, "AssetVideo", record_asset), \
+                 patch.object(poses.rr, "VideoFrameReference", record_reference):
+                poses.log_video(camera, clusters, ["first", "second"], 2)
+            self.assertEqual(len(references), 2)
 
     def test_the_default_height_floor_keeps_a_camera_at_ankle_height(self):
         """The Orlando panes stand at 0.28m and 0.43m.
@@ -178,11 +214,13 @@ class VideoTimelineTests(unittest.TestCase):
             self.assertNotIn("static", log.call_args.kwargs)
 
         with patch.object(poses, "video_times", return_value=[0.0, 5.0, 7.0, 8.0]), \
-             patch.object(poses, "iter_video_jpegs", return_value=iter(enumerate([b"jpeg"] * 4))), \
+             patch.object(poses.rr, "AssetVideo"), \
+             patch.object(poses.rr, "VideoFrameReference"), \
              patch.object(poses.rr, "set_time"), patch.object(poses.rr, "log") as log:
             poses.log_video(camera, clusters, ["camera/one", "camera/two"], None)
         self.assertEqual([call.args[0] for call in log.call_args_list], [
-            "unposed/clip/image", "camera/one/image", "camera/one/image", "camera/two/image",
+            "world/videos/clip", "unposed/clip/image", "camera/one/image",
+            "camera/one/image", "camera/two/image",
         ])
 
 

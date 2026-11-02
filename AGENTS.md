@@ -258,9 +258,10 @@ Group by pose before treating them as one thing: that is what
 **In Rerun, the transform must be on the camera entity, not below the pinhole.**
 A `Transform3D` logged at `<camera>/pose` while the `Pinhole` sits at `<camera>`
 applies to the child only, leaving the camera stuck at the origin looking up.
-Log `Transform3D` on the camera entity and `Pinhole` + the frame on its child —
-an `EncodedImage` of an ffmpeg-produced JPEG, since every frame of a match is
-logged and raw frames would be 60GB. The
+Log `Transform3D` on the camera entity and `Pinhole` + the frames on its child —
+the pane's own MP4 logged once as an `AssetVideo`, with a `VideoFrameReference`
+per frame, since every frame of a match is logged and a JPEG per frame would be
+60GB. The
 report's quaternion is field-to-camera (it projects field points into the
 picture) whereas a Rerun transform places camera axes in the world, so it is
 conjugated; using it as-is draws a frustum pointing backwards.
