@@ -137,8 +137,7 @@ fn build_championship_video(dest: &Path) {
     // live picture is what tells a camera layout from a results screen, and the
     // flat colour keeps the pane identifiable by pixel colour. The patches stay
     // clear of the spots the test samples.
-    let graph = format!(
-        "[6]split=4[q0][p1][p2][p3];\
+    let graph = "[6]split=4[q0][p1][p2][p3];\
          [0][q0]overlay=x=(W-140)/2:y=(H-100)/2[intro];\
          [1][p1]overlay=x=mod(t*220\\,W-140):y=60[top];\
          [2][p2]overlay=x=mod(t*170\\,W-140):y=20[left];\
@@ -148,7 +147,7 @@ fn build_championship_video(dest: &Path) {
          [left][vline][right]hstack=inputs=3[bottom_row];\
          [top_row][bottom_row]vstack[tiled];\
          [intro][tiled]concat=n=2:v=1:a=0[out]"
-    );
+        .to_string();
     ffmpeg(&[
         "-y",
         "-loglevel",

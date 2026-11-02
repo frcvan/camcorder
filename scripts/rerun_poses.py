@@ -5,7 +5,9 @@
 (plus the WPILib field layout they name) and logs, for each video:
 
 * the field outline and every tag on it, in field coordinates;
-* the camera, as a pinhole plus a transform per solved frame;
+* the camera, as a pinhole plus a transform per solved frame, drawn at the
+  frame's own lens — the focal length the pose was solved with, per frame when
+  the pane zoomed — so the field model and the picture in the frustum agree;
 * the frame itself, at the same time, projected from that camera;
 * every frame of the video itself, decoded once and logged at the video's own
   frame rate, so the picture and the plots run together;
@@ -84,13 +86,41 @@ class Camera:
         """Camera centre of the first solved frame, in field coordinates."""
         return np.array(self.solved[0]["position"], dtype=float)
 
-    def intrinsics(self) -> tuple[float, float, float, int, int]:
-        """(fx, cx, cy, width, height) from the report's assumed field of view."""
+    def focal_px(self, time: float | None = None) -> float | None:
+        """The focal length the frame at `time` was solved with, pixels.
+
+        `horizontal_fov_deg` is the same lens written in a coarser unit, and a
+        viewer that converts it back is a viewer drawing a frustum the solve
+        never used — the model then sits a little outside the picture along the
+        frame's edge, which looks like the camera being a degree off. The report
+        already carries the number the poses were solved at, per frame when the
+        pane zoomed (`ptz_station.frames`), otherwise for the file.
+        """
+        station = self.report.get("ptz_station") or {}
+        frames = station.get("frames") or []
+        if time is not None and frames:
+            nearest = min(frames, key=lambda frame: abs(float(frame["time"]) - time))
+            # Only the frame itself: a sample the station did not fit (another
+            # shot of the same pane) has no lens of its own here, and borrowing
+            # its neighbour's would draw it at the wrong zoom.
+            if abs(float(nearest["time"]) - time) <= 0.25 and "focal_px" in nearest:
+                return float(nearest["focal_px"])
+        if "focal_px" in self.report:
+            return float(self.report["focal_px"])
+        return None
+
+    def intrinsics(self, time: float | None = None) -> tuple[float, float, float, int, int]:
+        """(fx, cx, cy, width, height) of the lens the pose was solved with."""
         width = int(self.report["frame_width"])
         height = int(self.report["frame_height"])
-        fov_deg = float(self.report.get("horizontal_fov_deg", 60.0))
-        fx = float((width * 0.5) / np.tan(np.radians(fov_deg) * 0.5))
-        return fx, float((width - 1) * 0.5), float((height - 1) * 0.5), width, height
+        focal = self.focal_px(time)
+        if focal is None:
+            # A report from before `focal_px` was written: the field of view is
+            # all there is, and converting it back is exact for a square-pixel
+            # camera whose principal point is the centre of the frame.
+            fov_deg = float(self.report.get("horizontal_fov_deg", 60.0))
+            focal = float((width * 0.5) / np.tan(np.radians(fov_deg) * 0.5))
+        return focal, float((width - 1) * 0.5), float((height - 1) * 0.5), width, height
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +343,19 @@ def cluster_frames(
     return clusters
 
 
+def pinhole(camera: Camera, time: float | None = None) -> rr.Pinhole:
+    """The camera's lens as Rerun draws it, at `time` when the report has one."""
+    fx, cx, cy, width, height = camera.intrinsics(time)
+    return rr.Pinhole(
+        width=width,
+        height=height,
+        focal_length=fx,
+        principal_point=(cx, cy),
+        camera_xyz=rr.ViewCoordinates.RDF,
+        image_plane_distance=2.0,
+    )
+
+
 def log_camera_pinhole(entity: str, camera: Camera, first_time: float) -> None:
     """Show a frustum only once its first measured transform exists.
 
@@ -320,20 +363,9 @@ def log_camera_pinhole(entity: str, camera: Camera, first_time: float) -> None:
     which looks like a camera pointing up from the field even though no pose was
     measured yet. Do not invent a pose for that earlier footage.
     """
-    fx, cx, cy, width, height = camera.intrinsics()
     rr.set_time("video_time", duration=first_time)
     rr.set_time("frame", sequence=int(first_time * 1000))
-    rr.log(
-        f"{entity}/image",
-        rr.Pinhole(
-            width=width,
-            height=height,
-            focal_length=fx,
-            principal_point=(cx, cy),
-            camera_xyz=rr.ViewCoordinates.RDF,
-            image_plane_distance=2.0,
-        ),
-    )
+    rr.log(f"{entity}/image", pinhole(camera))
 
 
 def log_trajectory(name: str, clusters: list[list[dict]]) -> None:
@@ -465,9 +497,20 @@ def log_frames(camera: Camera, cluster: list[dict], entity: str) -> None:
     below a pinhole applies to that child only, leaving the camera at the origin
     looking straight up.
     """
+    shown: float | None = None
     for frame in cluster:
         rr.set_time("video_time", duration=float(frame["time"]))
         rr.set_time("frame", sequence=int(float(frame["time"]) * 1000))
+
+        # A pane that zoomed was solved at a different lens in every frame, and
+        # a frustum kept at one of those lenses does not contain the others'
+        # pictures: the model drifts out of them along the frame's edge by the
+        # zoom, which reads as the camera pointing slightly wrong. Re-log the
+        # pinhole whenever the frame's own lens moves.
+        focal = camera.intrinsics(float(frame["time"]))[0]
+        if shown is None or abs(focal - shown) > abs(shown) * 0.005:
+            rr.log(f"{entity}/image", pinhole(camera, float(frame["time"])))
+            shown = focal
 
         rr.log(
             entity,
@@ -567,6 +610,25 @@ def log_video(
     if logged != expected:
         raise ValueError(f"{camera.video}: decoded {logged} frames, expected {expected}")
     print(f"  {camera.name}: logged {logged} frame(s) of video", file=sys.stderr)
+
+
+def lens_note(camera: Camera) -> str | None:
+    """Why a frustum can be a little out even where the pose is right.
+
+    Rerun's pinhole is a pinhole: it has no radial term. When the run fitted one
+    (`k1`), the picture is bent and the frustum is not, so a tag near the frame's
+    edge is drawn a few pixels from where it appears in the image — which reads
+    as the camera being a degree off, and is the lens.
+    """
+    station = camera.report.get("ptz_station") or {}
+    k1 = float(station.get("k1") or 0.0)
+    if abs(k1) < 1e-6:
+        return None
+    return (
+        f"  the lens was fitted with radial distortion k1 = {k1:.3f}, which the "
+        f"viewer cannot draw: tags near the frame's edge will sit a few pixels "
+        f"off their picture, and the corners of the frustum with them"
+    )
 
 
 def log_station(camera: Camera) -> None:
@@ -853,6 +915,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         if report.get("focal_source"):
             print(f"  {report['focal_source']}")
+        note = lens_note(camera)
+        if note:
+            print(note)
         for index, cluster in enumerate(stations):
             heights = [float(frame["position"][2]) for frame in cluster]
             span = max(heights) - min(heights)

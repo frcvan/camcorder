@@ -150,7 +150,13 @@ class VideoTimelineTests(unittest.TestCase):
         self.assertEqual(log.call_args.args[0], "world/rivals/clip")
         drawn = markers.call_args
         self.assertEqual(drawn.args[0], [[9.0, -0.5, 2.0]])
-        self.assertIn("the mount is not there", drawn.kwargs["labels"][0])
+        # The marker is bare on purpose: a sentence pinned to every rival buries
+        # the field it is drawn on. The reason lives in the report, not here.
+        self.assertNotIn(
+            "labels",
+            drawn.kwargs,
+            "rival markers carry no text — a label per place covers the field",
+        )
 
         # A file with no rival anywhere logs nothing at all: an empty marker set
         # in the viewer reads as "the pose is certain", which is a lie.
@@ -178,6 +184,188 @@ class VideoTimelineTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in log.call_args_list], [
             "unposed/clip/image", "camera/one/image", "camera/one/image", "camera/two/image",
         ])
+
+
+def _matrix_from_xyzw(xyzw) -> "np.ndarray":
+    """The rotation matrix a Rerun quaternion describes, `xyzw` order."""
+    import numpy as np
+
+    x, y, z, w = np.asarray(xyzw, dtype=float) / np.linalg.norm(xyzw)
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def _report_rotation(wxyz) -> "np.ndarray":
+    """The report's field-to-camera rotation as a matrix, `wxyz` order."""
+    w, x, y, z = wxyz
+    return _matrix_from_xyzw([x, y, z, w])
+
+
+class CameraProjectionTests(unittest.TestCase):
+    """What the recording draws has to be the model the solve put there.
+
+    A frustum that is a little too wide, or turned half a step off, still looks
+    like a camera: the field and its tags are drawn and the picture is inside a
+    cone. It is only detectable by asking where a known field point lands. These
+    tests ask that of the values actually logged, so a rounded field of view, a
+    un-conjugated quaternion or a station's single lens used for a zoomed frame
+    all fail here rather than as "the blue camera looks a degree off".
+    """
+
+    #: Camera at (2, 3, 1.5) looking along field `+x`, level and unrolled:
+    #: camera x is field -y, camera y is field -z, camera z is field +x.
+    #: `wxyz`, field-to-camera, as the report stores it.
+    ROTATION = [0.5, 0.5, -0.5, 0.5]
+    POSITION = [2.0, 3.0, 1.5]
+
+    def report(self, **overrides) -> dict:
+        report = {
+            "video": "clip.mp4",
+            "tag_layout": None,
+            "frame_width": 640,
+            "frame_height": 480,
+            # The `--fov` guess is 30°, which is 1194px here; the solve used
+            # 900px. A recording drawn from the angle is a fifth too wide.
+            "horizontal_fov_deg": 30.0,
+            "focal_px": 900.0,
+            "solved": [],
+        }
+        report.update(overrides)
+        return report
+
+    def frame(self, time: float = 4.0) -> dict:
+        return {
+            "time": time,
+            "position": list(self.POSITION),
+            "rotation": list(self.ROTATION),
+            "yaw_deg": 0.0,
+            "pitch_deg": 0.0,
+            "roll_deg": 0.0,
+            "rms_px": 0.2,
+            "tags": [13],
+        }
+
+    def logged(self, report: dict, *frames: dict) -> list:
+        """The `Pinhole` and `Transform3D` the script builds for these frames."""
+        camera = poses.Camera("clip", report, None, None)
+        made = []
+
+        def record(**kwargs):
+            made.append(kwargs)
+            return kwargs
+
+        with patch.object(poses.rr, "set_time"), patch.object(poses.rr, "log"), \
+             patch.object(poses.rr, "Pinhole", record), \
+             patch.object(poses.rr, "Transform3D", record):
+            poses.log_frames(camera, list(frames), "world/cameras/clip")
+        return made
+
+    def test_the_drawn_frustum_puts_the_model_where_the_solve_put_it(self):
+        import numpy as np
+
+        made = self.logged(self.report(), self.frame())
+        pinholes = [call for call in made if "focal_length" in call]
+        transforms = [call for call in made if "rotation" in call]
+        self.assertEqual(len(pinholes), 1, "one station frame, one lens")
+        self.assertEqual(len(transforms), 1)
+
+        # The lens is the one solved with, not the guessed angle rounded back
+        # into pixels: 30° here would draw a frustum a fifth too wide, which at
+        # the frame's edge is a tag tens of pixels from where the picture has it.
+        self.assertAlmostEqual(pinholes[0]["focal_length"], 900.0)
+        self.assertAlmostEqual(pinholes[0]["principal_point"][0], (640 - 1) / 2)
+        self.assertAlmostEqual(pinholes[0]["principal_point"][1], (480 - 1) / 2)
+
+        point = np.array([7.0, 2.0, 0.5])
+        position = np.array(self.POSITION)
+        to_camera = _report_rotation(self.ROTATION)
+        expected = to_camera @ (point - position)
+        self.assertGreater(expected[2], 0.0, "the fixture's point must be in front")
+
+        # The transform goes the other way round: it places the camera's axes in
+        # the field, so it is the transpose of the report's rotation. Reading the
+        # report's quaternion as if it were that transform draws a camera looking
+        # backwards — a pose that still projects, onto the wrong pixels.
+        placed = _matrix_from_xyzw(transforms[0]["rotation"].xyzw)
+        np.testing.assert_allclose(placed @ placed.T, np.eye(3), atol=1e-9)
+        np.testing.assert_allclose(transforms[0]["translation"], position)
+        np.testing.assert_allclose(placed.T @ (point - position), expected, atol=1e-9)
+
+        focal = pinholes[0]["focal_length"]
+        cx, cy = pinholes[0]["principal_point"]
+        # Where the solve says the point is, from the report's own convention…
+        solved = np.array([
+            self.report()["focal_px"] * expected[0] / expected[2] + cx,
+            self.report()["focal_px"] * expected[1] / expected[2] + cy,
+        ])
+        # …and where the recording puts it, from the logged transform and lens.
+        through = placed.T @ (point - position)
+        drawn = np.array([
+            focal * through[0] / through[2] + cx,
+            focal * through[1] / through[2] + cy,
+        ])
+        np.testing.assert_allclose(drawn, solved, atol=1e-9)
+
+        # …and the fixture would notice the sign, rather than agreeing with the
+        # bug the way a test that projects from behind does.
+        wrong = _matrix_from_xyzw(self.ROTATION)
+        wrong_camera = wrong.T @ (point - position)
+        wrong_pixel = np.array([
+            focal * wrong_camera[0] / wrong_camera[2] + cx,
+            focal * wrong_camera[1] / wrong_camera[2] + cy,
+        ])
+        self.assertGreater(np.linalg.norm(wrong_pixel - solved), 20.0)
+
+    def test_a_zoomed_pane_is_drawn_at_each_frame_s_own_lens(self):
+        """A fixed camera that zooms was solved with a lens per frame.
+
+        The station reports one focal length, but `ptz_station.frames` carries
+        each frame's own: drawing the whole pane at one of them leaves the
+        model drifting out of the other pictures by the zoom, which is easy to
+        mistake for the camera being aimed a fraction wrong.
+        """
+        station = {
+            "focal_px": 900.0,
+            "frames": [
+                {"time": 4.0, "rotation": self.ROTATION, "focal_px": 700.0},
+                {"time": 9.0, "rotation": self.ROTATION, "focal_px": 1100.0},
+            ],
+        }
+        report = self.report(ptz_station=station)
+        made = self.logged(report, self.frame(4.0), self.frame(9.0))
+        lenses = [call["focal_length"] for call in made if "focal_length" in call]
+        self.assertEqual(lenses, [700.0, 1100.0])
+
+        camera = poses.Camera("clip", report, None, None)
+        self.assertAlmostEqual(camera.intrinsics(4.0)[0], 700.0)
+        self.assertAlmostEqual(camera.intrinsics(9.0)[0], 1100.0)
+        # A sample the station did not fit has no lens of its own here, and
+        # borrowing its neighbour's would draw it at the wrong zoom.
+        self.assertAlmostEqual(camera.intrinsics(30.0)[0], 900.0)
+
+    def test_a_report_without_a_lens_falls_back_to_its_field_of_view(self):
+        import numpy as np
+
+        camera = poses.Camera("old", {
+            "frame_width": 160, "frame_height": 120, "horizontal_fov_deg": 60.0,
+        }, None, None)
+        self.assertAlmostEqual(camera.intrinsics()[0], (160 * 0.5) / np.tan(np.radians(30.0)))
+
+    def test_a_fitted_distortion_is_reported_because_the_viewer_cannot_draw_it(self):
+        """Rerun's pinhole has no radial term.
+
+        When the run fitted one, the rendered tags sit a few pixels from the
+        picture near the frame's edge — which reads as a small aim error and is
+        not one. Saying so is cheaper than letting the reader chase it.
+        """
+        camera = poses.Camera("clip", self.report(ptz_station={"k1": -0.06}), None, None)
+        note = poses.lens_note(camera)
+        self.assertIsNotNone(note)
+        self.assertIn("-0.060", note)
+        self.assertIsNone(poses.lens_note(poses.Camera("clip", self.report(), None, None)))
 
 
 if __name__ == "__main__":

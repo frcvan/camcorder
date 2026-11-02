@@ -905,8 +905,8 @@ fn extract_frame(path: &Path, time: f64, width: u32, height: u32) -> Result<YuvF
     let output = run_capture(&mut cmd, "ffmpeg frame sampling")?;
 
     let (w, h) = (width as usize, height as usize);
-    let chroma_width = (w + 1) / 2;
-    let chroma_height = (h + 1) / 2;
+    let chroma_width = w.div_ceil(2);
+    let chroma_height = h.div_ceil(2);
     let luma_len = w * h;
     let chroma_len = chroma_width * chroma_height;
     let expected = luma_len + 2 * chroma_len;
@@ -937,7 +937,10 @@ fn sample_times(window: (f64, f64), duration: f64, count: usize) -> Vec<f64> {
         start
     };
     let span = end - start;
-    if !(span > 0.5) {
+    // `start` is never NaN (`f64::max` returns the other operand when one is),
+    // and `end` falls back to `start`, so a span that is not a usable length
+    // here is a short one rather than an incomparable value.
+    if span <= 0.5 {
         return vec![start];
     }
     (0..count)

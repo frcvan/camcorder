@@ -211,9 +211,10 @@ fn run() -> Result<()> {
             Ok(report) => {
                 written += report.outputs.len();
                 eprintln!(
-                    "[views] {} ({} · {:.0}fps · {:.0}s) -> {} segment(s) · {} view(s) · {} new file(s)",
+                    "[views] {} ({}x{} · {:.0}fps · {:.0}s) -> {} segment(s) · {} view(s) · {} new file(s)",
                     download.match_key,
-                    format!("{}x{}", report.info.width, report.info.height),
+                    report.info.width,
+                    report.info.height,
                     report.info.fps,
                     report.info.duration,
                     report.segments.len(),

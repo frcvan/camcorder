@@ -418,7 +418,10 @@ and ffprobe helpers.
 `scripts/rerun_poses.py` loads pose reports into [Rerun](https://rerun.io): the
 field and its tags, each camera as a frustum with the frame it saw, its path,
 and plots of position, height, heading, pitch, roll and reprojection error over
-the timeline.
+the timeline. Each frustum is drawn at the lens its frame was solved with —
+`ptz_station.frames[].focal_px` when the pane zoomed, otherwise the report's
+`focal_px` — not at the `horizontal_fov_deg` guess rounded back into pixels, so
+the field model inside it is where the solve put it.
 
 ```bash
 .venv/bin/python scripts/rerun_poses.py output/frc386/poses --rrd field.rrd
