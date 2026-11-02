@@ -39,7 +39,7 @@ The Rerun viewer is needed only at the very end:
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install rerun-sdk numpy
+.venv/bin/pip install "rerun-sdk==0.41.0" numpy
 ```
 
 ### 2. Point it at the match
@@ -228,7 +228,7 @@ words instead of printing a confident-looking coordinate.
 | Rust (edition 2021) | builds the program | `cargo --version` |
 | `ffmpeg` + `ffprobe` | probing, scene detection, cropping, pose frames | `ffmpeg -version` |
 | `yt-dlp` | downloading YouTube match videos | `yt-dlp --version` |
-| `rerun-sdk` + `numpy` in `.venv` | only for `scripts/rerun_poses.py` | `.venv/bin/python -c "import rerun"` |
+| `rerun-sdk==0.41.0` + `numpy` in `.venv` | only for `scripts/rerun_poses.py` | `.venv/bin/python -c "import rerun"`, `.venv/bin/rerun --version` |
 
 `ffmpeg` and `yt-dlp` must be on `PATH`; they are run as child processes and
 there is no bundled fallback.
