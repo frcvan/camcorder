@@ -369,6 +369,11 @@ pub struct TagObservation {
     pub margin: f32,
     /// Bit errors corrected while decoding; zero is a clean read.
     pub hamming: u8,
+    /// How well the picture pinned each corner, in pixels, in the same order as
+    /// `corners` — [`super::corners::refine_with_quality`]'s measurement. One
+    /// pixel each where nothing measured them, which makes the weighted fit
+    /// equal to the plain one.
+    pub sigma_px: [f64; 4],
 }
 
 impl TagObservation {

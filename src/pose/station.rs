@@ -1126,6 +1126,9 @@ mod tests {
                     field: corner,
                     image: (u, v),
                     tag: *id,
+                    // A projected corner has no measurement error; the fitting
+                    // tests below are about the geometry, not the weighting.
+                    sigma_px: 1.0,
                 });
             }
         }

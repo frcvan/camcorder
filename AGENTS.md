@@ -9,7 +9,8 @@ camera was from the AprilTags in the picture.
 | what | command |
 | --- | --- |
 | build | `cargo build --release` |
-| test everything | `cargo test` (134 tests: 118 unit, 3 CLI, 6 pose pipeline, 7 video pipeline) |
+| test everything | `cargo test` (144 tests: 125 unit, 3 CLI, 6 pose pipeline, 7 video pipeline, 3 detector scoreboard) |
+| detector scoreboard | `cargo test --test detector_scoreboard -- --nocapture` |
 | one area | `cargo test --lib pose` / `cargo test --test views_pipeline` |
 | lint | `cargo clippy --all-targets` |
 | format | `rustfmt --edition 2021 <files you touched>` |
@@ -42,8 +43,10 @@ src/pose/        camera pose from AprilTags — self-contained subsystem
   model.rs       image-to-model line observations, from the field asset
   frames.rs      RGB frame sampling (owns all ffmpeg use) and luma from it
   enhance.rs     contrast stretch + unsharp, before the decoder sees a frame
-  detect.rs      36h11 detection (the only file that knows kornia)
-  corners.rs     sub-pixel corners: the tag's borders fitted and intersected
+  detect.rs      36h11 detection (the only file that knows kornia), and the
+                 larger second look every frame gets
+  corners.rs     sub-pixel corners: the tag's borders fitted and intersected,
+                 with the uncertainty each corner is left with
   solve.rs       planar init, Levenberg-Marquardt refinement, branch choice
   verify.rs      which of two admitted poses the picture backs, and why
   trust.rs       margin floors, tag-id voting, physical gates, confidence
@@ -190,6 +193,27 @@ frames below 0.5m, on the theory that the mirror branch is underground. Orlando'
 panes stand at 0.28m and 0.43m, so that default discarded every frame that had
 solved correctly and kept only the ones that had not. Only a pose below the
 carpet is impossible; the viewer's floor now defaults to 0.
+
+**Every frame is read twice, and the corners are weighted by how well they were
+measured.** A tag fifteen pixels across has a border under two pixels, so each
+frame is decoded once at native size and once on a 2× Lanczos enlargement, and
+the two lists are merged — the native reading is what is kept where both find a
+tag, because it is the one on the original pixel grid. Measured on synthetic
+ladders, the enlarged look reads tags of 8-12px that the native one misses
+entirely and loses none it finds. The border fit also reports `sigma_px` per
+corner — from the width of the ramp each border's crossing is bracketed over,
+not from how straight the edge is, which is always zero on a clean fixture — and
+every joint fit weights by it, so a small soft tag no longer leans a pose the
+large crisp one has already settled. `rms_px` is still measured *without* the
+weights, because every threshold in the code was set in pixels. The ladder the
+numbers came from is `tests/detector_scoreboard.rs`; it holds a regression still
+and does not stand in for footage.
+
+**A repaired decode is not a clean one.** The decoder's `hamming` is not
+decoration: a read that needed two or more bits corrected is kept only if another
+frame read the same id, however large the tag looks — a patch of carpet that
+decodes at all decodes after repairs. The frame's report carries it as `hamming`
+beside `weakest_margin`.
 
 **A weak fit is reported, not withheld.** `pose` always reports the shared
 position it fitted, together with `sigma_m`: the largest displacement of that

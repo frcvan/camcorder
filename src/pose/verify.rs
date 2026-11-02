@@ -650,6 +650,7 @@ mod tests {
             corners: image,
             margin: 200.0,
             hamming: 0,
+            sigma_px: [1.0; 4],
         }
     }
 

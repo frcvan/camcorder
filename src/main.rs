@@ -1,3 +1,5 @@
+#![warn(clippy::all)]
+
 use std::{
     path::{Path, PathBuf},
     process::ExitCode,

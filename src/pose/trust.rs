@@ -39,6 +39,17 @@ const SMALL_TAG_SHARE: f32 = 0.35;
 /// tag at low margin is the classic false positive; the same id turning up
 /// again is the evidence that it is real.
 const CORROBORATION: f64 = 0.2;
+/// Bits of correction after which a read has to be corroborated by another frame
+/// whatever its margin.
+///
+/// 36h11 corrects up to three bit errors, and the difference between a clean read
+/// and a repaired one is not how sure the decoder is but how much of the code it
+/// had to change to get there. A tag the picture barely resolved does not decode
+/// at all rather than decoding wrongly; a *repaired* read of a large tag is the
+/// shape a false positive from a patch of carpet takes. So two corrections and
+/// the frame has to be backed by another one, which is the same test a marginal
+/// margin already has to pass.
+const REPAIRED_HAMMING: u8 = 2;
 
 /// Nobody films a field from underneath its carpet.
 const MIN_HEIGHT_M: f64 = 0.0;
@@ -121,21 +132,29 @@ pub fn id_support(frames: &[Vec<TagObservation>]) -> HashMap<u16, IdSupport> {
 
 /// Whether one detection earns a place in the frame.
 ///
-/// Two ways in: it cleared the margin its own size deserves, or it is a small
-/// tag read marginally *and* another frame read the same id. A small tag seen
-/// in one frame at a low margin on its own is not evidence, it is a guess.
+/// Two ways in: it cleared the margin its own size deserves, or it is marginal
+/// *and* another frame read the same id. A small tag seen in one frame at a low
+/// margin on its own is not evidence, it is a guess.
+///
+/// A read the decoder had to repair is a third case, and it takes the stricter
+/// door: however large the tag and however good the margin, it needs a second
+/// frame, because the id only appeared after the decoder changed bits to find it
+/// — which is exactly the shape a false positive from a patch of carpet has.
 pub fn keep(detection: &TagObservation, support: &HashMap<u16, IdSupport>, base: f32) -> bool {
     let width = detection.pixel_width();
     let floor = margin_floor(width, base);
     if detection.margin < floor {
         return false;
     }
-    if detection.margin >= base {
-        return true;
-    }
-    support
+    let corroborated = support
         .get(&detection.id)
-        .is_some_and(|evidence| evidence.frames >= 2 && evidence.fraction >= CORROBORATION)
+        .is_some_and(|evidence| evidence.frames >= 2 && evidence.fraction >= CORROBORATION);
+    // A read that needed bits corrected is a repaired tag, not a clear one, and
+    // has to be backed by another frame however large it looks.
+    if detection.hamming >= REPAIRED_HAMMING {
+        return corroborated;
+    }
+    detection.margin >= base || corroborated
 }
 
 /// Why a pose cannot be a camera filming a field, or `Ok` if it can.
@@ -247,7 +266,51 @@ mod tests {
             corners: [[0.0, 0.0], [0.0, width], [width, width], [width, 0.0]],
             margin,
             hamming: 0,
+            sigma_px: [1.0; 4],
         }
+    }
+
+    fn repaired(id: u16, width: f64, margin: f32, hamming: u8) -> TagObservation {
+        TagObservation {
+            hamming,
+            ..observation(id, width, margin)
+        }
+    }
+
+    #[test]
+    fn a_read_that_needed_bits_corrected_must_be_seen_again() {
+        // The decoder reports how many bits it had to change to reach an id, and
+        // that is a different question from how sure it is: a patch of carpet
+        // decodes to *something* after two corrections, and a clean read of the
+        // same tag does not. One frame alone is not enough for a repaired read,
+        // whatever margin it claims and however large the tag looks.
+        let base = 30.0;
+        let mut support = HashMap::new();
+        assert!(
+            !keep(&repaired(13, 120.0, 200.0, 2), &support, base),
+            "a repaired read of a large tag still needs a second frame"
+        );
+        assert!(
+            !keep(&repaired(13, 120.0, 200.0, 3), &support, base),
+            "a read three bits off is the one most likely to be wrong"
+        );
+        // One bit corrected is the ordinary case on footage that has been through
+        // a codec, and the margin says what it is worth.
+        assert!(keep(&repaired(13, 120.0, 200.0, 1), &support, base));
+        assert!(!keep(&repaired(13, 120.0, 5.0, 1), &support, base));
+
+        // Backed by another frame, the same repaired read is kept.
+        support.insert(
+            13,
+            IdSupport {
+                fraction: 0.5,
+                frames: 2,
+            },
+        );
+        assert!(keep(&repaired(13, 120.0, 200.0, 2), &support, base));
+        // …but one that is both repaired and marginal still has to clear the
+        // floor its size deserves.
+        assert!(!keep(&repaired(13, 16.0, 4.0, 2), &support, base));
     }
 
     #[test]

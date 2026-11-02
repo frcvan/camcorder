@@ -63,12 +63,20 @@ const RIVAL_MIN_SEPARATION_M: f64 = 1.0;
 /// than two near-ties is not a branch question but a broken frame.
 const MAX_RIVALS: usize = 2;
 
+/// The smallest uncertainty a corner is weighted by. The border fit clamps
+/// its own answer, and this is only a guard against a division by zero.
+const MIN_WEIGHT_SIGMA_PX: f64 = 0.05;
+
 /// A 3D point on a tag and where it was seen.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Correspondence {
     pub(crate) field: Vec3,
     pub(crate) image: (f64, f64),
     pub(crate) tag: u16,
+    /// How far this corner could be from where it was put, pixels — the border
+    /// fit's own answer. A corner the picture pinned well counts for more in
+    /// every fit that uses it.
+    pub(crate) sigma_px: f64,
 }
 
 /// Solve the camera pose from one frame's detections, with no outside hint.
@@ -167,6 +175,7 @@ pub(crate) fn correspondences(
                 field: *corner,
                 image: (observation.corners[index][0], observation.corners[index][1]),
                 tag: observation.id,
+                sigma_px: observation.sigma_px[index],
             });
         }
     }
@@ -609,13 +618,13 @@ pub(crate) fn refine(
     let mut rotation = Mat3::from_quaternion(start.rotation);
     let mut position = start.position;
     let mut lambda = 1e-3;
-    let mut cost = residuals(rotation, position, corners, camera)
+    let mut cost = weighted_residuals(rotation, position, corners, camera)
         .iter()
         .map(|value| value * value)
         .sum::<f64>();
 
     for _ in 0..80 {
-        let base = residuals(rotation, position, corners, camera);
+        let base = weighted_residuals(rotation, position, corners, camera);
         // Numeric Jacobian: cheap at six parameters and a few dozen corners.
         let mut jacobian = vec![vec![0.0f64; 6]; base.len()];
         // Three rotations, then three translations.
@@ -626,7 +635,7 @@ pub(crate) fn refine(
             } else {
                 (rotation, shift(position, axis - 3, *step))
             };
-            let shifted = residuals(rotated, moved, corners, camera);
+            let shifted = weighted_residuals(rotated, moved, corners, camera);
             for (row, value) in shifted.iter().enumerate() {
                 jacobian[row][axis] = (value - base[row]) / step;
             }
@@ -662,7 +671,8 @@ pub(crate) fn refine(
                 position.y + step[4],
                 position.z + step[5],
             );
-            let candidate = residuals(candidate_rotation, candidate_position, corners, camera);
+            let candidate =
+                weighted_residuals(candidate_rotation, candidate_position, corners, camera);
             let candidate_cost = candidate.iter().map(|value| value * value).sum::<f64>();
             if candidate_cost < cost {
                 rotation = candidate_rotation.orthonormalized();
@@ -679,8 +689,17 @@ pub(crate) fn refine(
         }
     }
 
+    // The cost the fit minimised is in units of each corner's own uncertainty;
+    // the error the report quotes is in pixels, so it is measured again without
+    // the weights, which is also the measure every threshold was set against.
     let count = corners.len();
-    let rms = (cost / count.max(1) as f64).sqrt();
+    let plain = residuals(
+        Mat3::from_quaternion(rotation.to_quaternion()),
+        position,
+        corners,
+        camera,
+    );
+    let rms = (plain.iter().map(|value| value * value).sum::<f64>() / count.max(1) as f64).sqrt();
     if !rms.is_finite() {
         return None;
     }
@@ -768,7 +787,7 @@ fn refine_ptz_with(
         views
             .iter()
             .flat_map(|view| {
-                ptz_residuals(
+                ptz_weighted_residuals(
                     Mat3::from_quaternion(view.pose.rotation),
                     view.pose.position,
                     view,
@@ -788,7 +807,7 @@ fn refine_ptz_with(
         let mut blocks = Vec::with_capacity(result.len());
         for view in &result {
             let rotation = Mat3::from_quaternion(view.pose.rotation);
-            let base = ptz_residuals(rotation, position, view, &view.camera);
+            let base = ptz_weighted_residuals(rotation, position, view, &view.camera);
             let mut jac = vec![[0.0; 7]; base.len()];
             for (axis, step) in [1e-6_f64; 7].into_iter().enumerate() {
                 let mut camera = view.camera;
@@ -802,7 +821,7 @@ fn refine_ptz_with(
                     camera.fx *= step.exp();
                     camera.fy *= step.exp();
                 }
-                let shifted = ptz_residuals(rot, pos, view, &camera);
+                let shifted = ptz_weighted_residuals(rot, pos, view, &camera);
                 for row in 0..base.len() {
                     jac[row][axis] = (shifted[row] - base[row]) / step;
                 }
@@ -938,7 +957,41 @@ fn refine_ptz_with(
 pub(crate) const LINE_WEIGHT_CAP: usize = 8;
 
 fn ptz_residuals(rotation: Mat3, position: Vec3, view: &PtzView, camera: &Intrinsics) -> Vec<f64> {
-    let mut out = residuals(rotation, position, &view.corners, camera);
+    append_line_residuals(
+        residuals(rotation, position, &view.corners, camera),
+        rotation,
+        position,
+        view,
+        camera,
+    )
+}
+
+/// The same residuals with each corner weighted by its own uncertainty: what the
+/// joint fit minimises. Kept apart from [`ptz_residuals`] so the errors the
+/// report quotes, and the limits they are compared against, stay in pixels.
+fn ptz_weighted_residuals(
+    rotation: Mat3,
+    position: Vec3,
+    view: &PtzView,
+    camera: &Intrinsics,
+) -> Vec<f64> {
+    append_line_residuals(
+        weighted_residuals(rotation, position, &view.corners, camera),
+        rotation,
+        position,
+        view,
+        camera,
+    )
+}
+
+/// Corner residuals followed by this frame's model-line residuals.
+fn append_line_residuals(
+    mut out: Vec<f64>,
+    rotation: Mat3,
+    position: Vec3,
+    view: &PtzView,
+    camera: &Intrinsics,
+) -> Vec<f64> {
     let weight = (LINE_WEIGHT_CAP as f64 / view.lines.len().max(LINE_WEIGHT_CAP) as f64).sqrt();
     for line in &view.lines {
         let a = camera.project(rotation.mul_vec(line.start - position));
@@ -996,6 +1049,30 @@ fn residuals(
                 out.push(penalty);
             }
         }
+    }
+    out
+}
+
+/// The residuals each corner divided by the uncertainty its own border fit
+/// reported.
+///
+/// A broadcast pane holds tags from fifteen pixels across to eighty, and the
+/// picture pins a corner on the large one several times more tightly than on the
+/// small one. Counting them alike lets the small tag's noise lean a pose the
+/// large tag had already settled — and the small tag is also the one more likely
+/// to have been read in the wrong place. These are dimensionless, which is why
+/// the error in the report is measured from [`residuals`] instead.
+fn weighted_residuals(
+    rotation: Mat3,
+    position: Vec3,
+    corners: &[Correspondence],
+    camera: &Intrinsics,
+) -> Vec<f64> {
+    let mut out = residuals(rotation, position, corners, camera);
+    for (index, corner) in corners.iter().enumerate() {
+        let scale = 1.0 / corner.sigma_px.max(MIN_WEIGHT_SIGMA_PX);
+        out[2 * index] *= scale;
+        out[2 * index + 1] *= scale;
     }
     out
 }
@@ -1149,6 +1226,10 @@ mod tests {
                 corners: image,
                 margin: 100.0,
                 hamming: 0,
+                // Nothing measured these corners beyond the projection that made
+                // them, so they count alike in every fit — which is what a test
+                // that corrupts one of them needs.
+                sigma_px: [1.0; 4],
             });
         }
         observations
@@ -1318,6 +1399,56 @@ mod tests {
             "position {:?} vs {:?}",
             solution.pose.position,
             truth.position
+        );
+    }
+
+    #[test]
+    fn a_corner_the_picture_barely_resolved_does_not_drag_the_pose() {
+        // Two tags pinned to a tenth of a pixel, and a third the picture barely
+        // resolved whose corners are ten pixels out — well inside what a
+        // fifteen-pixel tag gives. The pose has to stay with the pair that anchors
+        // it. Counting all three alike lets the small tag pull the camera off by a
+        // good part of its own error, and the fit's residual cannot see that: the
+        // wrong answer fits its own corners *better*.
+        let layout = test_layout(&[
+            facing_tag(3, Vec3::new(4.0, 6.0, 0.5)),
+            facing_tag(4, Vec3::new(8.0, 6.0, 0.5)),
+            facing_tag(5, Vec3::new(12.0, 6.0, 0.5)),
+        ]);
+        let camera = Intrinsics::from_horizontal_fov(1280, 720, 60.0);
+        let truth = look_at(Vec3::new(8.0, -1.0, 3.5), Vec3::new(8.0, 6.0, 0.5));
+        let mut observations = project_corners(&layout, &[3, 4, 5], 0.1651, truth, &camera);
+        for corner in observations[2].corners.iter_mut() {
+            corner[0] += 10.0;
+            corner[1] -= 6.0;
+        }
+        observations[0].sigma_px = [0.1; 4];
+        observations[1].sigma_px = [0.1; 4];
+        observations[2].sigma_px = [20.0; 4];
+        let corners = correspondences(&observations, &layout, 0.1651);
+        let weighted = refine(truth, &corners, &camera).expect("refines");
+        let weighted_error = (weighted.pose.position - truth.position).norm();
+
+        // The same frame, as though every corner had been measured as well as the
+        // pair that anchors it. Same starting pose, so the only difference is the
+        // weights.
+        observations[2].sigma_px = [0.1; 4];
+        let flat_corners = correspondences(&observations, &layout, 0.1651);
+        let flat = refine(truth, &flat_corners, &camera).expect("refines");
+        let flat_error = (flat.pose.position - truth.position).norm();
+
+        eprintln!(
+            "camera {weighted_error:.3}m from the truth with the weights, {flat_error:.3}m \
+             without them"
+        );
+        assert!(
+            weighted_error < 0.02,
+            "the pair the picture pinned should hold the pose, it is {weighted_error:.3}m out"
+        );
+        assert!(
+            flat_error > weighted_error * 3.0,
+            "the weighting has to be what does it: {weighted_error:.3}m weighted against \
+             {flat_error:.3}m when all three tags count alike"
         );
     }
 

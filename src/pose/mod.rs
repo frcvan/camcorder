@@ -66,6 +66,13 @@ const MODEL_ROUND_MAX_MOVE_M: f64 = 1.0;
 /// A frame whose solve reprojects worse than this is not trusted.
 const DEFAULT_MAX_RMS_PX: f64 = 8.0;
 
+/// How much a frame is enlarged for the second look at its tags. The detector's
+/// own parameters are in pixels, and a broadcast pane's tags are fifteen to
+/// twenty pixels across, so the second look is where a tag that small is found
+/// at all. A frame already large enough that its scale is not the problem is not
+/// enlarged — see [`detect::TagDetector::detect_magnified`].
+const MAGNIFY: usize = 2;
+
 /// How to estimate a pose.
 #[derive(Debug, Clone)]
 pub struct PoseOptions {
@@ -251,6 +258,20 @@ impl Judge<'_> {
                         .map(|detection| detection.margin)
                 })
                 .fold(f32::INFINITY, f32::min);
+            // The worst read the pose rests on: a repaired tag is weaker evidence
+            // than a clean one, and the report says so beside the margin.
+            let hamming = solution
+                .tags
+                .iter()
+                .filter_map(|id| {
+                    frame
+                        .detections
+                        .iter()
+                        .find(|detection| detection.id == *id)
+                        .map(|detection| detection.hamming)
+                })
+                .max()
+                .unwrap_or(0);
             let weakest_support = solution
                 .tags
                 .iter()
@@ -328,6 +349,7 @@ impl Judge<'_> {
                 } else {
                     0.0
                 },
+                hamming,
                 side: verdict,
                 check,
             }));
@@ -401,7 +423,10 @@ pub fn estimate(video: &Path, options: &PoseOptions) -> Result<PoseReport> {
                 frame.height as usize,
             );
         }
-        reads.push(detector.detect(&frame.pixels)?);
+        reads.push(detect::merge(
+            detector.detect(&frame.pixels)?,
+            detector.detect_magnified(&frame.pixels, MAGNIFY)?,
+        ));
     }
     let support = trust::id_support(&reads);
 
@@ -415,13 +440,16 @@ pub fn estimate(video: &Path, options: &PoseOptions) -> Result<PoseReport> {
             .filter(|detection| trust::keep(detection, &support, options.min_margin))
             .map(|mut detection| {
                 // The detector's quad is good to a fraction of a pixel; the
-                // border fit takes it the rest of the way.
-                detection.corners = corners::refine(
+                // border fit takes it the rest of the way, and says how far
+                // it trusts each corner so the fits can weight them.
+                let refined = corners::refine_with_quality(
                     &frame.pixels,
                     frame.width as usize,
                     frame.height as usize,
                     &detection.corners,
                 );
+                detection.corners = refined.corners;
+                detection.sigma_px = refined.sigma_px;
                 detection
             })
             .collect();

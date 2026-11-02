@@ -689,6 +689,9 @@ fn the_cli_flags_turn_the_enhancement_and_the_weak_frames_off() {
     let confidence = first["confidence"].as_f64().expect("a confidence");
     assert!((0.0..1.0).contains(&confidence), "confidence {confidence}");
     assert!(first["weakest_margin"].is_number());
+    // How many bits the decode had to correct is part of what a reader has to
+    // interpret a pose with: a repaired read is weaker evidence than a clean one.
+    assert!(first["hamming"].is_number());
     assert!(report["station"]["position"].is_array());
 
     let (stderr, report) = run(&["--no-preprocess"]);

@@ -26,6 +26,8 @@ pub struct FrameOutcome<'a> {
     pub confidence: f64,
     /// The least confident detection the solve used, in the decoder's margin.
     pub weakest_margin: f32,
+    /// Bits the decode had to correct on the worst of the tags the solve used.
+    pub hamming: u8,
     pub side: Option<SideVerdict>,
     /// What the picture says about the pose beyond the corners it was fitted
     /// to, and the rival pose a lone tag leaves open.
@@ -177,6 +179,10 @@ pub struct FramePose {
     pub confidence: f64,
     /// The least confident detection the solve used, in the decoder's margin.
     pub weakest_margin: f32,
+    /// Bits the decoder had to correct on the worst of the tags this pose was
+    /// solved from. Zero is a clean read; two or more and the frame's ids had to
+    /// be backed by another frame for the detection to be kept at all.
+    pub hamming: u8,
     /// Camera centre in field coordinates, metres, `+z` up.
     pub position: [f64; 3],
     /// Camera orientation: field axes to camera axes, as a quaternion.
@@ -208,6 +214,7 @@ impl FramePose {
             rms_px: outcome.rms_px,
             confidence: outcome.confidence,
             weakest_margin: outcome.weakest_margin,
+            hamming: outcome.hamming,
             position: [pose.position.x, pose.position.y, pose.position.z],
             rotation: [rotation.w, rotation.x, rotation.y, rotation.z],
             yaw_deg: pose.yaw_deg(),
